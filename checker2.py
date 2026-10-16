@@ -18,6 +18,7 @@ from playwright.async_api import async_playwright
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, update
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 # ======================================================================
 #  LOGS SIN BUFFER
@@ -40,8 +41,8 @@ def utcnow():
 #  CONFIGURACIÓN
 # ======================================================================
 EN_RAILWAY      = bool(os.getenv("RAILWAY_ENVIRONMENT"))
-DEBUG           = not EN_RAILWAY      # en PC: True
-MOSTRAR_VENTANA = not EN_RAILWAY      # en PC: navegador visible
+DEBUG           = not EN_RAILWAY
+MOSTRAR_VENTANA = not EN_RAILWAY
 SLOW_MO         = 250
 USAR_PROXY      = False
 ROTAR_SESION    = True
@@ -111,6 +112,12 @@ class FoundNumber(Base):
     created_at = Column(DateTime, default=utcnow)
 
 
+class CelularUsado(Base):
+    __tablename__ = "celulares_usados"
+    celular = Column(String(20), primary_key=True)
+    created_at = Column(DateTime, default=utcnow)
+
+
 class Stats(Base):
     __tablename__ = "stats"
     id = Column(Integer, primary_key=True, index=True)
@@ -176,7 +183,7 @@ def ensure_stats_row():
 
 
 # ======================================================================
-#  CORREOS BLOQUEADOS (DB + cache)
+#  CORREOS BLOQUEADOS
 # ======================================================================
 _bloqueados_cache = None
 
@@ -238,7 +245,7 @@ async def _goto_con_retry(page, url, intentos=3):
 
 
 # ======================================================================
-#  CORREOS ROTATIVOS (saltando bloqueados)
+#  CORREOS ROTATIVOS
 # ======================================================================
 _indice_correo = 0
 
@@ -253,7 +260,6 @@ def _lista_correos():
 
 
 def correo_actual() -> str:
-    """Devuelve el correo actual, saltando automáticamente los bloqueados."""
     global _indice_correo
     lst = _lista_correos()
     n = len(lst)
@@ -269,7 +275,7 @@ def correo_actual() -> str:
 def avanzar_correo() -> str:
     global _indice_correo
     _indice_correo += 1
-    nuevo = correo_actual()          # salta bloqueados
+    nuevo = correo_actual()
     try:
         guardar_kv("indice_correo", _indice_correo)
     except Exception:
@@ -418,7 +424,8 @@ class MemoriaDB:
                       f"Intentos: {intentos}",
                       f"Aciertos: {aciertos}",
                       f"Tasa: {self.tasa_acierto()*100:.2f}%",
-                      f"Correos bloqueados: {contar_bloqueados()}", ""]
+                      f"Correos bloqueados: {contar_bloqueados()}",
+                      f"Números usados: {contar_usados()}", ""]
             return "\n".join(lineas)
         finally:
             db.close()
@@ -434,6 +441,14 @@ def contar_existentes() -> int:
     db = SessionLocal()
     try:
         return db.query(FoundNumber).count()
+    finally:
+        db.close()
+
+
+def contar_usados() -> int:
+    db = SessionLocal()
+    try:
+        return db.query(CelularUsado).count()
     finally:
         db.close()
 
@@ -529,7 +544,8 @@ class Telegram:
             return
         texto = (f"📊 <b>Cuentas guardadas:</b> {contar_existentes()}\n"
                  f"🎯 Tasa: {mem.tasa_acierto()*100:.2f}%\n"
-                 f"🚫 Correos bloqueados: {contar_bloqueados()}")
+                 f"🚫 Correos bloqueados: {contar_bloqueados()}\n"
+                 f"🔢 Números usados: {contar_usados()}")
         if self.contador_msg_id:
             await self.editar(self.contador_msg_id, texto)
         else:
@@ -568,11 +584,14 @@ class Telegram:
                 "/numeros — celulares en formato +57 (DB)\n"
                 "/correo — correo actual\n"
                 "/bloqueados — correos bloqueados\n"
+                "/usados — total de números usados\n"
                 "/stats — tasa de acierto\n", chat_id=chat_id)
         elif cmd == "/contador":
             await self.enviar(f"📊 Cuentas guardadas: <b>{contar_existentes()}</b>", chat_id=chat_id)
         elif cmd == "/correo":
             await self.enviar(f"📧 Correo actual: <code>{correo_actual()}</code>", chat_id=chat_id)
+        elif cmd == "/usados":
+            await self.enviar(f"🔢 Números usados en DB: <b>{contar_usados()}</b>", chat_id=chat_id)
         elif cmd == "/bloqueados":
             db = SessionLocal()
             try:
@@ -715,10 +734,28 @@ def preparar_proxy(proxy):
 
 
 # ======================================================================
-#  GENERACIÓN INTELIGENTE
+#  GENERACIÓN INTELIGENTE + PERSISTENCIA DE USADOS
 # ======================================================================
 _pila_vecinos = deque(maxlen=20000)
 _usados_cache = None
+_usados_pendientes = set()
+
+
+def _norm_celular(s):
+    d = re.sub(r"\D", "", s or "")
+    if len(d) > 10:
+        d = d[-10:]
+    return d
+
+
+def _extraer_celular(linea):
+    """Saca un celular colombiano (10 dígitos, empieza en 3) de cualquier línea."""
+    for tok in re.findall(r"\d+", linea or ""):
+        if len(tok) == 10 and tok[0] == "3":
+            return tok
+        if len(tok) == 12 and tok.startswith("57") and tok[2] == "3":
+            return tok[-10:]
+    return ""
 
 
 def _usados():
@@ -732,13 +769,44 @@ def recargar_usados():
     global _usados_cache
     db = SessionLocal()
     try:
-        _usados_cache = {r[0] for r in db.query(FoundNumber.celular).all()}
+        s = {r[0] for r in db.query(FoundNumber.celular).all()}
+        s |= {r[0] for r in db.query(CelularUsado.celular).all()}
+        _usados_cache = s
     finally:
         db.close()
 
 
 def _marcar_usado(n):
     _usados().add(n)
+    _usados_pendientes.add(n)
+
+
+def flush_usados():
+    """Vuelca a la DB los números usados pendientes (idempotente)."""
+    if not _usados_pendientes:
+        return
+    lote = list(_usados_pendientes)
+    _usados_pendientes.clear()
+    db = SessionLocal()
+    try:
+        stmt = pg_insert(CelularUsado).on_conflict_do_nothing(index_elements=["celular"])
+        db.execute(stmt, [{"celular": c} for c in lote])
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        _usados_pendientes.update(lote)
+        print(f"[!] flush_usados: {e}")
+    finally:
+        db.close()
+
+
+async def flusher_usados():
+    while True:
+        await asyncio.sleep(8)
+        try:
+            flush_usados()
+        except Exception:
+            traceback.print_exc()
 
 
 def _valido(s):
@@ -789,6 +857,89 @@ def siguiente_celular():
         if _valido(c):
             _marcar_usado(c)
             return c
+
+
+# ======================================================================
+#  IMPORTADOR DE BASES EXISTENTES
+# ======================================================================
+def importar_existentes(ruta="existentes.txt"):
+    """existentes.txt: 'ref3 | celular' (o solo 'celular')."""
+    if not os.path.exists(ruta):
+        print(f"[import] no existe {ruta}, se omite")
+        return 0
+    db = SessionLocal()
+    nuevos = 0
+    try:
+        ya = {r[0] for r in db.query(FoundNumber.celular).all()}
+        with open(ruta, encoding="utf-8", errors="ignore") as f:
+            for linea in f:
+                linea = linea.strip()
+                if not linea:
+                    continue
+                partes = [p.strip() for p in linea.split("|")]
+                cel = _extraer_celular(partes[-1]) or _extraer_celular(linea)
+                if len(cel) != 10 or cel in ya:
+                    continue
+                ref3 = partes[0] if len(partes) >= 2 else ""
+                ya.add(cel)
+                db.add(FoundNumber(celular=cel, ref3=ref3))
+                nuevos += 1
+                if nuevos % 1000 == 0:
+                    db.commit()
+                    print(f"[import] existentes: {nuevos}...")
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        print(f"[!] import existentes: {e}")
+    finally:
+        db.close()
+    print(f"[import] existentes.txt -> {nuevos} registros nuevos")
+    return nuevos
+
+
+def importar_usados(ruta="celulares_usados.txt"):
+    """celulares_usados.txt: un número por línea (o 'indice  numero')."""
+    if not os.path.exists(ruta):
+        print(f"[import] no existe {ruta}, se omite")
+        return 0
+    db = SessionLocal()
+    nuevos = 0
+    lote = []
+    try:
+        ya = {r[0] for r in db.query(CelularUsado.celular).all()}
+        with open(ruta, encoding="utf-8", errors="ignore") as f:
+            for linea in f:
+                cel = _extraer_celular(linea)
+                if len(cel) != 10 or cel in ya:
+                    continue
+                ya.add(cel)
+                lote.append({"celular": cel})
+                nuevos += 1
+                if len(lote) >= 2000:
+                    stmt = pg_insert(CelularUsado).on_conflict_do_nothing(index_elements=["celular"])
+                    db.execute(stmt, lote)
+                    db.commit()
+                    lote.clear()
+                    print(f"[import] usados: {nuevos}...")
+        if lote:
+            stmt = pg_insert(CelularUsado).on_conflict_do_nothing(index_elements=["celular"])
+            db.execute(stmt, lote)
+            db.commit()
+    except Exception as e:
+        db.rollback()
+        print(f"[!] import usados: {e}")
+    finally:
+        db.close()
+    print(f"[import] celulares_usados.txt -> {nuevos} números nuevos")
+    return nuevos
+
+
+def ejecutar_import():
+    print("[import] cargando bases existentes a la DB...")
+    n1 = importar_existentes()
+    n2 = importar_usados()
+    recargar_usados()
+    print(f"[import] listo. existentes={n1} usados={n2} | total usados en memoria={len(_usados())}")
 
 
 # ======================================================================
@@ -959,7 +1110,6 @@ JS_PSE_ESTADO = """
 }
 """
 
-# Detección de la página "Correo bloqueado" de PSE
 JS_BLOQUEO = """
 () => {
     const t = (document.body ? document.body.innerText : '').toLowerCase();
@@ -1265,7 +1415,6 @@ async def ejecutar(celular, proxy=None):
                 except Exception as e:
                     print(f"[DBG] no se pudo leer estado PSE: {e}")
 
-            # --- esperar a que pase algo: página Nu o "Correo bloqueado" ---
             fin = asyncio.get_event_loop().time() + 40
             page_nu = None
             bloqueado = False
@@ -1368,7 +1517,6 @@ async def procesar_un_celular(celular):
         reintentos = 0
         while reintentos < 30:
             estado = await ejecutar(celular, px)
-            # si el correo se agotó o quedó bloqueado, reintenta el MISMO celular con otro correo
             if estado in ("correo_agotado", "correo_bloqueado"):
                 reintentos += 1
                 continue
@@ -1412,7 +1560,7 @@ async def worker(n):
             if intentos_total % 25 == 0:
                 print(f"[mem] Tasa actual: {mem.tasa_acierto()*100:.2f}% "
                       f"({mem.data['aciertos']}/{mem.data['intentos']}) "
-                      f"| bloqueados: {contar_bloqueados()}")
+                      f"| usados: {contar_usados()} | bloqueados: {contar_bloqueados()}")
 
             if intentos_total % 500 == 0:
                 recargar_usados()
@@ -1445,12 +1593,22 @@ async def _poll_supervisado():
 
 
 async def main():
+    hacer_import = "--import" in sys.argv
+
     cargar_correo_guardado()
     ensure_stats_row()
     recargar_bloqueados()
+    recargar_usados()
 
-    arg = sys.argv[1] if len(sys.argv) > 1 else None
-    if arg and arg.isdigit() and len(arg) >= 10:
+    if hacer_import:
+        ejecutar_import()
+
+    arg = None
+    for a in sys.argv[1:]:
+        if a.isdigit() and len(a) >= 10:
+            arg = a
+            break
+    if arg:
         _marcar_usado(arg)
         _pila_vecinos.appendleft(arg)
 
@@ -1459,7 +1617,7 @@ async def main():
     except Exception as e:
         print(f"[!] Error iniciando Telegram: {e}")
 
-    tareas = []
+    tareas = [asyncio.create_task(flusher_usados())]
     if tg.activo:
         tareas.append(asyncio.create_task(_poll_supervisado()))
         try:
@@ -1473,6 +1631,7 @@ async def main():
     print(f"[i] Correo inicial: {correo_actual()}")
     print(f"[i] Tasa histórica: {mem.tasa_acierto()*100:.2f}%")
     print(f"[i] Correos bloqueados: {contar_bloqueados()}")
+    print(f"[i] Números usados (DB): {contar_usados()}")
     print(f"[i] Concurrencia: {CONCURRENCIA} | Límite: {LIMITE or 'infinito'}")
     print(f"[i] Cuentas en DB: {contar_existentes()}")
     print(f"[i] DEBUG={DEBUG} | Ventana visible={MOSTRAR_VENTANA}")
