@@ -391,11 +391,23 @@ class Telegram:
         msg = upd.get("message") or {}
         texto = (msg.get("text") or "").strip()
         chat_id = str((msg.get("chat") or {}).get("id", ""))
+        
+        # --- AGREGAR ESTO ---
+        print(f"[DEBUG TELEGRAM] Recibido: '{texto}' de ChatID: {chat_id}")
+        # --------------------
+
         if not texto or not chat_id:
             return
+        
         if not self.chat_id:
             self.chat_id = chat_id
+            print(f"[DEBUG TELEGRAM] ChatID guardado: {self.chat_id}")
+
         cmd = texto.split()[0].split("@")[0].lower()
+
+        # --- AGREGAR ESTO ---
+        print(f"[DEBUG TELEGRAM] Comando detectado: {cmd}")
+        # --------------------
 
         if cmd in ("/start", "/ayuda", "/help"):
             await self.enviar(
