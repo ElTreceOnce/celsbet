@@ -11,7 +11,9 @@ from collections import deque
 from typing import Dict, Tuple, Optional
 
 import aiohttp
-import aiohttp.ClientTimeout
+# --- CORRECCIÓN IMPORTANTE ---
+from aiohttp import ClientTimeout 
+# ----------------------------
 from playwright.async_api import async_playwright
 
 # --- DB CHANGE: Imports para SQLAlchemy 2.0 ---
@@ -186,12 +188,12 @@ class BetplayChecker:
                                          enable_cleanup_closed=True, ttl_dns_cache=300)
         self.session = aiohttp.ClientSession(
             headers=HEADERS, connector=connector,
-            timeout=aiohttp.ClientTimeout(total=10, connect=5),
+            timeout=ClientTimeout(total=10, connect=5),
             cookie_jar=aiohttp.CookieJar(),
         )
         try:
             async with self.session.get("https://betplay.com.co/", ssl=True,
-                                        timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                                        timeout=ClientTimeout(total=5)) as resp:
                 return resp.status == 200
         except Exception as e:
             logger.error(f"Error init betplay: {type(e).__name__}: {e}")
@@ -206,7 +208,7 @@ class BetplayChecker:
         for intento in range(2):
             try:
                 async with self.session.post(url, json={}, ssl=True,
-                                             timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                                             timeout=ClientTimeout(total=8)) as resp:
                     status = resp.status
                     try:
                         data = await resp.json()
@@ -307,9 +309,9 @@ class Telegram:
     async def start(self):
         if not self.activo:
             return
-        self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10))
+        self.session = aiohttp.ClientSession(timeout=ClientTimeout(total=10))
         try:
-            async with self.session.get(self.url("getUpdates"), params={"timeout": 0}, timeout=aiohttp.ClientTimeout(total=10)) as r:
+            async with self.session.get(self.url("getUpdates"), params={"timeout": 0}, timeout=ClientTimeout(total=10)) as r:
                 data = await r.json()
             for upd in data.get("result", []):
                 self.offset = upd["update_id"] + 1
@@ -324,7 +326,7 @@ class Telegram:
         if not self.activo or not self.session:
             return None
         try:
-            timeout = aiohttp.ClientTimeout(total=30)
+            timeout = ClientTimeout(total=30)
             if files:
                 data = aiohttp.FormData()
                 for k, v in (params or {}).items():
@@ -360,7 +362,7 @@ class Telegram:
         if not cid:
             return
         try:
-            timeout = aiohttp.ClientTimeout(total=60)
+            timeout = ClientTimeout(total=60)
             async with self.session.post(self.url("sendDocument"), 
                                          json={"chat_id": cid, "caption": caption, "parse_mode": "HTML"},
                                          data={"document": contenido}, timeout=timeout) as r:
@@ -476,7 +478,7 @@ class Telegram:
             return
         while True:
             try:
-                timeout = aiohttp.ClientTimeout(total=40)
+                timeout = ClientTimeout(total=40)
                 async with self.session.get(self.url("getUpdates"),
                                             params={"timeout": 30, "offset": self.offset},
                                             timeout=timeout) as r:
@@ -759,7 +761,7 @@ NU_HADOU = "https://prod-global-global-hadou.prod-waf.nu.com.co/api"
 
 async def nu_api_procesar(auth_id: str) -> Optional[Dict]:
     session = aiohttp.ClientSession(
-        timeout=aiohttp.ClientTimeout(total=20),
+        timeout=ClientTimeout(total=20),
         headers={"user-agent": UA_BROWSER,
                  "accept": "application/json",
                  "content-type": "application/json",
