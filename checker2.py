@@ -50,7 +50,7 @@ ROTAR_SESION    = True
 PAIS            = "co"
 X_CUSTOM_VERSION = "4.0.71"
 
-CONCURRENCIA = 3 if EN_RAILWAY else 1
+CONCURRENCIA = 6 if EN_RAILWAY else 1
 LIMITE       = None
 AUTO_IMPORT  = True
 
