@@ -15,7 +15,8 @@ import aiohttp
 from aiohttp import ClientTimeout
 from playwright.async_api import async_playwright
 
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, update
+from sqlalchemy import (create_engine, Column, Integer, String, Text,
+                        DateTime, update, text)
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -51,6 +52,7 @@ X_CUSTOM_VERSION = "4.0.71"
 
 CONCURRENCIA = 3 if EN_RAILWAY else 1
 LIMITE       = None
+AUTO_IMPORT  = True
 
 TELEGRAM_TOKEN   = "8005799410:AAGe720T8KDkwL9v32ldhMpWitHzANN3Wwk"
 TELEGRAM_CHAT_ID = "1415509092"
@@ -126,6 +128,12 @@ class Stats(Base):
     updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
 
 
+class StatsLegacy(Base):
+    __tablename__ = "stats_legacy"
+    clave = Column(String(40), primary_key=True)
+    valor = Column(Text)
+
+
 class KV(Base):
     __tablename__ = "kv"
     key = Column(String(50), primary_key=True)
@@ -169,17 +177,27 @@ def leer_kv(k, default=None):
         db.close()
 
 
-def ensure_stats_row():
+def ensure_contadores():
+    """Crea las filas intentos/aciertos si no existen (sin pisar las importadas)."""
     db = SessionLocal()
     try:
-        if not db.query(Stats).first():
-            db.add(Stats(intentos=0, aciertos=0))
-            db.commit()
+        for k in ("intentos", "aciertos"):
+            if not db.query(StatsLegacy).filter(StatsLegacy.clave == k).first():
+                db.add(StatsLegacy(clave=k, valor="0"))
+        db.commit()
     except Exception as e:
         db.rollback()
-        print(f"[!] ensure_stats_row: {e}")
+        print(f"[!] ensure_contadores: {e}")
     finally:
         db.close()
+
+
+def _localizar(nombre):
+    for base in (os.getcwd(), os.path.dirname(os.path.abspath(__file__))):
+        ruta = os.path.join(base, nombre)
+        if os.path.exists(ruta):
+            return ruta
+    return None
 
 
 # ======================================================================
@@ -371,64 +389,67 @@ class BetplayChecker:
 
 
 # ======================================================================
-#  MEMORIA / ESTADÍSTICAS
+#  MEMORIA / ESTADÍSTICAS  (lee y escribe en stats_legacy)
 # ======================================================================
 class MemoriaDB:
     def __init__(self):
         pass
 
-    @property
-    def data(self):
+    def _leer(self, clave, default=0):
         db = SessionLocal()
         try:
-            s = db.query(Stats).first()
-            return {"intentos": s.intentos if s else 0,
-                    "aciertos": s.aciertos if s else 0}
+            row = db.query(StatsLegacy).filter(StatsLegacy.clave == clave).first()
+            if not row or row.valor in (None, ""):
+                return default
+            return int(float(row.valor))
+        except Exception:
+            return default
         finally:
             db.close()
 
-    async def registrar(self, celular, exito):
+    def _inc(self, clave, delta):
+        """Incremento atómico sobre stats_legacy."""
         db = SessionLocal()
         try:
-            db.execute(
-                update(Stats).values(
-                    intentos=Stats.intentos + 1,
-                    aciertos=Stats.aciertos + (1 if exito else 0),
-                    updated_at=utcnow(),
-                )
-            )
+            res = db.execute(
+                text("UPDATE stats_legacy "
+                     "SET valor = ((COALESCE(NULLIF(valor,''),'0'))::bigint + :d)::text "
+                     "WHERE clave = :k"),
+                {"d": delta, "k": clave})
+            if res.rowcount == 0:
+                db.add(StatsLegacy(clave=clave, valor=str(delta)))
             db.commit()
         except Exception as e:
-            print(f"[!] Error DB registrar: {e}")
             db.rollback()
+            print(f"[!] _inc {clave}: {e}")
         finally:
             db.close()
+
+    @property
+    def data(self):
+        return {"intentos": self._leer("intentos"),
+                "aciertos": self._leer("aciertos")}
+
+    async def registrar(self, celular, exito):
+        self._inc("intentos", 1)
+        if exito:
+            self._inc("aciertos", 1)
 
     def tasa_acierto(self):
-        db = SessionLocal()
-        try:
-            stats = db.query(Stats).first()
-            if stats and stats.intentos > 0:
-                return stats.aciertos / stats.intentos
-            return 0.0
-        finally:
-            db.close()
+        intentos = self._leer("intentos")
+        aciertos = self._leer("aciertos")
+        return (aciertos / intentos) if intentos > 0 else 0.0
 
     def resumen(self):
-        db = SessionLocal()
-        try:
-            stats = db.query(Stats).first()
-            intentos = stats.intentos if stats else 0
-            aciertos = stats.aciertos if stats else 0
-            lineas = ["📈 <b>Estadísticas</b>",
-                      f"Intentos: {intentos}",
-                      f"Aciertos: {aciertos}",
-                      f"Tasa: {self.tasa_acierto()*100:.2f}%",
-                      f"Correos bloqueados: {contar_bloqueados()}",
-                      f"Números usados: {contar_usados()}", ""]
-            return "\n".join(lineas)
-        finally:
-            db.close()
+        intentos = self._leer("intentos")
+        aciertos = self._leer("aciertos")
+        lineas = ["📈 <b>Estadísticas</b>",
+                  f"Intentos: {intentos}",
+                  f"Aciertos: {aciertos}",
+                  f"Tasa: {self.tasa_acierto()*100:.2f}%",
+                  f"Correos bloqueados: {contar_bloqueados()}",
+                  f"Números usados: {contar_usados()}", ""]
+        return "\n".join(lineas)
 
 
 mem = MemoriaDB()
@@ -656,13 +677,12 @@ class Telegram:
         elif cmd == "/reset_stats":
             db = SessionLocal()
             try:
-                stats = db.query(Stats).first()
-                if stats:
-                    stats.intentos = 0
-                    stats.aciertos = 0
-                    db.commit()
+                db.execute(text("UPDATE stats_legacy SET valor = '0' "
+                                "WHERE clave IN ('intentos','aciertos')"))
+                db.commit()
                 await self.enviar("♻️ Estadísticas reseteadas", chat_id=chat_id)
             except Exception as e:
+                db.rollback()
                 print(f"[!] Error reset stats: {e}")
             finally:
                 db.close()
@@ -748,13 +768,29 @@ def _norm_celular(s):
     return d
 
 
-def _extraer_celular(linea):
-    """Saca un celular colombiano (10 dígitos, empieza en 3) de cualquier línea."""
-    for tok in re.findall(r"\d+", linea or ""):
-        if len(tok) == 10 and tok[0] == "3":
-            return tok
-        if len(tok) == 12 and tok.startswith("57") and tok[2] == "3":
-            return tok[-10:]
+def _extraer_celular(texto):
+    """Saca un celular colombiano (10 dígitos, empieza en 3) de un texto."""
+    if not texto:
+        return ""
+    for tok in re.split(r"[\s,;\t|]+", texto):
+        d = re.sub(r"\D", "", tok)
+        if len(d) == 10 and d[0] == "3":
+            return d
+        if len(d) == 12 and d.startswith("57") and d[2] == "3":
+            return d[2:]
+    d = re.sub(r"\D", "", texto)
+    if len(d) == 10 and d[0] == "3":
+        return d
+    if len(d) == 12 and d.startswith("57"):
+        return d[2:]
+    if len(d) > 10:
+        for i in range(len(d) - 9):
+            if d[i] == "3":
+                return d[i:i + 10]
+    for tok in re.split(r"[\s,;\t|]+", texto):
+        d = re.sub(r"\D", "", tok)
+        if len(d) == 10:
+            return d
     return ""
 
 
@@ -782,7 +818,6 @@ def _marcar_usado(n):
 
 
 def flush_usados():
-    """Vuelca a la DB los números usados pendientes (idempotente)."""
     if not _usados_pendientes:
         return
     lote = list(_usados_pendientes)
@@ -860,13 +895,14 @@ def siguiente_celular():
 
 
 # ======================================================================
-#  IMPORTADOR DE BASES EXISTENTES
+#  IMPORTADOR
 # ======================================================================
-def importar_existentes(ruta="existentes.txt"):
-    """existentes.txt: 'ref3 | celular' (o solo 'celular')."""
-    if not os.path.exists(ruta):
-        print(f"[import] no existe {ruta}, se omite")
+def importar_existentes(nombre="existentes.txt"):
+    ruta = _localizar(nombre)
+    if not ruta:
+        print(f"[import] no existe {nombre}")
         return 0
+    print(f"[import] leyendo {ruta}")
     db = SessionLocal()
     nuevos = 0
     try:
@@ -877,31 +913,30 @@ def importar_existentes(ruta="existentes.txt"):
                 if not linea:
                     continue
                 partes = [p.strip() for p in linea.split("|")]
-                cel = _extraer_celular(partes[-1]) or _extraer_celular(linea)
+                cel = _extraer_celular(partes[-1])
                 if len(cel) != 10 or cel in ya:
                     continue
-                ref3 = partes[0] if len(partes) >= 2 else ""
                 ya.add(cel)
-                db.add(FoundNumber(celular=cel, ref3=ref3))
+                db.add(FoundNumber(celular=cel, ref3=(partes[0] if len(partes) >= 2 else "")))
                 nuevos += 1
                 if nuevos % 1000 == 0:
                     db.commit()
-                    print(f"[import] existentes: {nuevos}...")
         db.commit()
     except Exception as e:
         db.rollback()
         print(f"[!] import existentes: {e}")
     finally:
         db.close()
-    print(f"[import] existentes.txt -> {nuevos} registros nuevos")
+    print(f"[import] existentes.txt -> {nuevos} nuevos")
     return nuevos
 
 
-def importar_usados(ruta="celulares_usados.txt"):
-    """celulares_usados.txt: un número por línea (o 'indice  numero')."""
-    if not os.path.exists(ruta):
-        print(f"[import] no existe {ruta}, se omite")
+def importar_usados(nombre="celulares_usados.txt"):
+    ruta = _localizar(nombre)
+    if not ruta:
+        print(f"[import] no existe {nombre}")
         return 0
+    print(f"[import] leyendo {ruta}")
     db = SessionLocal()
     nuevos = 0
     lote = []
@@ -909,7 +944,7 @@ def importar_usados(ruta="celulares_usados.txt"):
         ya = {r[0] for r in db.query(CelularUsado.celular).all()}
         with open(ruta, encoding="utf-8", errors="ignore") as f:
             for linea in f:
-                cel = _extraer_celular(linea)
+                cel = _extraer_celular(linea.strip())
                 if len(cel) != 10 or cel in ya:
                     continue
                 ya.add(cel)
@@ -920,7 +955,6 @@ def importar_usados(ruta="celulares_usados.txt"):
                     db.execute(stmt, lote)
                     db.commit()
                     lote.clear()
-                    print(f"[import] usados: {nuevos}...")
         if lote:
             stmt = pg_insert(CelularUsado).on_conflict_do_nothing(index_elements=["celular"])
             db.execute(stmt, lote)
@@ -930,16 +964,49 @@ def importar_usados(ruta="celulares_usados.txt"):
         print(f"[!] import usados: {e}")
     finally:
         db.close()
-    print(f"[import] celulares_usados.txt -> {nuevos} números nuevos")
+    print(f"[import] celulares_usados.txt -> {nuevos} nuevos")
     return nuevos
+
+
+def importar_stats_json(nombre="stats.json"):
+    """Guarda stats.json en stats_legacy. NO pisa intentos/aciertos vivos."""
+    ruta = _localizar(nombre)
+    if not ruta:
+        print(f"[import] no existe {nombre}")
+        return 0
+    print(f"[import] leyendo {ruta}")
+    with open(ruta, encoding="utf-8", errors="ignore") as f:
+        data = json.load(f)
+    db = SessionLocal()
+    n = 0
+    try:
+        for k, v in data.items():
+            val = json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list)) else str(v)
+            row = db.query(StatsLegacy).filter(StatsLegacy.clave == k).first()
+            if k in ("intentos", "aciertos") and row:
+                continue
+            if row:
+                row.valor = val
+            else:
+                db.add(StatsLegacy(clave=k, valor=val))
+            n += 1
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        print(f"[!] import stats: {e}")
+    finally:
+        db.close()
+    print(f"[import] stats.json -> {n} claves")
+    return n
 
 
 def ejecutar_import():
     print("[import] cargando bases existentes a la DB...")
     n1 = importar_existentes()
     n2 = importar_usados()
+    n3 = importar_stats_json()
     recargar_usados()
-    print(f"[import] listo. existentes={n1} usados={n2} | total usados en memoria={len(_usados())}")
+    print(f"[import] listo. existentes={n1} usados={n2} stats={n3}")
 
 
 # ======================================================================
@@ -1593,14 +1660,12 @@ async def _poll_supervisado():
 
 
 async def main():
-    hacer_import = "--import" in sys.argv
-
     cargar_correo_guardado()
-    ensure_stats_row()
+    ensure_contadores()
     recargar_bloqueados()
     recargar_usados()
 
-    if hacer_import:
+    if AUTO_IMPORT or "--import" in sys.argv:
         ejecutar_import()
 
     arg = None
