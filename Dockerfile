@@ -2,15 +2,17 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Instalar dependencias de Python
+# --- AÑADIR ESTO: Instalar librerías de sistema para PostgreSQL ---
+RUN apt-get update && apt-get install -y \
+    libpq-dev \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+# --------------------------------------------------------------
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-
-# Instalar Playwright y navegador Chromium
 RUN playwright install --with-deps chromium
 
-# Copiar los archivos del proyecto
 COPY . .
 
-# Comando para iniciar checker2.py
 CMD ["python", "checker2.py"]
