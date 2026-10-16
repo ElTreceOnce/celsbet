@@ -1,4 +1,4 @@
 aiohttp
 playwright
 sqlalchemy
-psycopg2-binary
+psycopg
