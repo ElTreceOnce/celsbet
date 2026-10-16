@@ -80,7 +80,7 @@ PROXIES = [
 # ======================================================================
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
-    "postgresql://postgres:VHvfQHhexqvHhlJDpzBJCltcWseWRvmg@postgres.railway.internal:5432/railway"
+    "postgresql://postgres:VHvfQHhexqvHhlJDpzBJCltcWseWRvmg@reseau.proxy.rlwy.net:42532/railway"
 )
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
